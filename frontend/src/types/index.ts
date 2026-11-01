@@ -495,4 +495,120 @@ export interface IncrementalSyncResult {
   timestamp: string;
 }
 
+export type CDSClassificationType = 'BASIC' | 'COMPOSITE' | 'CONSUMPTION' | 'PARAMETERIZED' | 'UNKNOWN';
+
+export type WorkflowStatus =
+  | 'REQUIREMENT_ANALYSIS_STARTED'
+  | 'REQUIRED_FIELDS_EXTRACTED'
+  | 'EXTRACTION_FIRST_SEARCH_STARTED'
+  | 'EXISTING_EXTRACTION_ENABLED_CDS'
+  | 'FALLBACK_CATALOG_SEARCH_STARTED'
+  | 'BASIC_CDS_DISCOVERY_COMPLETED'
+  | 'SOURCE_SELECTION_PENDING'
+  | 'SOURCE_CDS_APPROVED'
+  | 'JOIN_CONFIGURATION_PENDING'
+  | 'JOIN_CONFIGURATION_APPROVED'
+  | 'WRAPPER_GENERATION_STARTED'
+  | 'WRAPPER_GENERATED'
+  | 'STATIC_VALIDATION_PASSED'
+  | 'SAP_SOURCE_ONLY_VALIDATION_UNSUPPORTED'
+  | 'VALIDATION_FAILED'
+  | 'FINAL_HUMAN_REVIEW_PENDING'
+  | 'FINAL_APPROVAL_GRANTED'
+  | 'SAVED_INACTIVE'
+  | 'CHECKRUN_PASSED'
+  | 'ACTIVATED_IN_SAP_DEV'
+  | 'EXTRACTION_ENABLED_VERIFIED'
+  | 'NO_SOLUTION';
+
+export interface ClassificationResult {
+  cds_name: string;
+  classification: CDSClassificationType;
+  classification_evidence: string;
+  is_basic: boolean;
+  is_parameterized: boolean;
+  vdm_view_type_annotation?: string;
+  parameter_count?: number;
+  parameters?: string[];
+  vdm_evidence_detail?: string;
+}
+
+export interface OutputFieldSelection {
+  field_name: string;
+  source_cds: string;
+  data_type: string;
+  length?: number | null;
+  decimals?: number | null;
+  is_key: boolean;
+  field_label?: string;
+  selected_for_output: boolean;
+  output_alias?: string | null;
+}
+
+export interface JoinCondition {
+  left_field: string;
+  right_field: string;
+  operator?: string;
+  logic_operator?: string;
+}
+
+export interface JoinRelationship {
+  left_cds: string;
+  right_cds: string;
+  join_type: string;
+  conditions: JoinCondition[];
+  cardinality?: string;
+  relationship_evidence_type?: string;
+  evidence_detail?: string;
+  is_user_edited?: boolean;
+}
+
+export interface JoinValidationIssue {
+  code: string;
+  message: string;
+  severity: 'ERROR' | 'WARNING' | 'INFO';
+  left_cds?: string;
+  right_cds?: string;
+  field?: string;
+}
+
+export interface JoinValidationResult {
+  is_valid: boolean;
+  status: WorkflowStatus;
+  errors: JoinValidationIssue[];
+  warnings: JoinValidationIssue[];
+  relationships: JoinRelationship[];
+  output_fields: OutputFieldSelection[];
+  requires_approval: boolean;
+  is_approved: boolean;
+}
+
+export interface CorrectionLoopAttempt {
+  attempt: number;
+  prompt_focus?: string;
+  generated_code?: string;
+  errors_count: number;
+  warnings_count: number;
+  errors: Array<{ rule: string; message: string; line_number?: number }>;
+  valid: boolean;
+}
+
+export interface WrapperGenerationResult {
+  code: string;
+  explanation: string;
+  artifact_name: string;
+  validation: {
+    valid: boolean;
+    errors: Array<{ rule: string; message: string; line_number?: number }>;
+    warnings: Array<{ rule: string; message: string; line_number?: number }>;
+    status?: string;
+  };
+  sap_source_validation_status?: string;
+  sap_source_validation_investigation?: string;
+  correction_attempts_count: number;
+  correction_history?: CorrectionLoopAttempt[];
+  status: WorkflowStatus;
+}
+
+
 

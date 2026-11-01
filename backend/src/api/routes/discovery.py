@@ -222,4 +222,57 @@ async def get_table_lineage_endpoint(
     return result
 
 
+from src.services.cds_classifier import cds_classifier
+from src.services.join_validator import join_validator, JoinRelationship, OutputFieldSelection
+
+
+class AllFieldsPayload(BaseModel):
+    view_names: List[str]
+
+
+class ValidateJoinsPayload(BaseModel):
+    selected_views: List[str]
+    relationships: List[dict] = []
+    output_fields: Optional[List[dict]] = None
+
+
+@router.get("/classify/{cds_name}", summary="Classifies a CDS view as BASIC, COMPOSITE, CONSUMPTION, PARAMETERIZED, or UNKNOWN")
+async def classify_cds_view(cds_name: str):
+    """Classifies a CDS view candidate using authentic SAP DDL source and verified metadata."""
+    res = cds_classifier.classify_view(cds_name)
+    return res.to_dict()
+
+
+@router.post("/all-fields", summary="Loads all verified technical fields for selected CDS views")
+async def get_all_fields_endpoint(payload: AllFieldsPayload):
+    """Returns all available fields with data types, lengths, decimals, and key status for selected views."""
+    return join_validator.get_all_fields_for_views(payload.view_names)
+
+
+@router.post("/validate-joins", summary="Validates multi-CDS relationships, data types, cardinalities, and risks")
+async def validate_joins_endpoint(payload: ValidateJoinsPayload):
+    """Performs deterministic join validation distinguishing SAP-verified vs user-proposed relationships."""
+    relationships = [JoinRelationship(**r) for r in payload.relationships] if payload.relationships else []
+    output_fields = [OutputFieldSelection(**f) for f in payload.output_fields] if payload.output_fields else None
+    res = join_validator.validate_join_configuration(
+        selected_views=payload.selected_views,
+        relationships=relationships,
+        output_fields=output_fields,
+    )
+    return res.model_dump()
+
+
+@router.post("/approve-joins", summary="Explicit human approval gate for source CDS and join configuration")
+async def approve_joins_endpoint(payload: ValidateJoinsPayload):
+    """Enforces human approval of source CDS and join configuration before LLM code generation."""
+    relationships = [JoinRelationship(**r) for r in payload.relationships] if payload.relationships else []
+    output_fields = [OutputFieldSelection(**f) for f in payload.output_fields] if payload.output_fields else None
+    res = join_validator.approve_join_configuration(
+        selected_views=payload.selected_views,
+        relationships=relationships,
+        output_fields=output_fields,
+    )
+    return res.model_dump()
+
+
 

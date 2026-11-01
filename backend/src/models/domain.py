@@ -84,6 +84,34 @@ class DeploymentStatus(str, Enum):
     FAILED = "FAILED"
 
 
+class CDSClassificationType(str, Enum):
+    BASIC = "BASIC"
+    COMPOSITE = "COMPOSITE"
+    CONSUMPTION = "CONSUMPTION"
+    PARAMETERIZED = "PARAMETERIZED"
+    UNKNOWN = "UNKNOWN"
+
+
+class WorkflowStatus(str, Enum):
+    EXISTING_EXTRACTION_ENABLED_CDS = "EXISTING_EXTRACTION_ENABLED_CDS"
+    BASIC_CDS_DISCOVERY_COMPLETED = "BASIC_CDS_DISCOVERY_COMPLETED"
+    SOURCE_SELECTION_PENDING = "SOURCE_SELECTION_PENDING"
+    JOIN_CONFIGURATION_PENDING = "JOIN_CONFIGURATION_PENDING"
+    JOIN_CONFIGURATION_APPROVED = "JOIN_CONFIGURATION_APPROVED"
+    WRAPPER_GENERATED = "WRAPPER_GENERATED"
+    STATIC_VALIDATION_PASSED = "STATIC_VALIDATION_PASSED"
+    ADT_VALIDATION_PASSED = "ADT_VALIDATION_PASSED"
+    SAP_SOURCE_ONLY_VALIDATION_UNSUPPORTED = "SAP_SOURCE_ONLY_VALIDATION_UNSUPPORTED"
+    PENDING_HUMAN_APPROVAL = "PENDING_HUMAN_APPROVAL"
+    ACTIVATED = "ACTIVATED"
+    EXTRACTION_ENABLED_VERIFIED = "EXTRACTION_ENABLED_VERIFIED"
+    FAILED_VALIDATION = "FAILED_VALIDATION"
+    UNVERIFIED = "UNVERIFIED"
+    NO_SOLUTION = "NO_SOLUTION"
+    CUSTOM_WRAPPER_PENDING_APPROVAL = "CUSTOM_WRAPPER_PENDING_APPROVAL"
+    CUSTOM_WRAPPER_EXTRACTION_ENABLED_VERIFIED = "CUSTOM_WRAPPER_EXTRACTION_ENABLED_VERIFIED"
+
+
 class ReviewStatus(str, Enum):
     PENDING_REVIEW = "PENDING_REVIEW"
     APPROVED = "APPROVED"
@@ -584,6 +612,10 @@ class SAPActivationResult(BaseModel):
     syntax_messages: List[Dict[str, Any]] = Field(default_factory=list, description="Structured compiler diagnostics")
     error_message: Optional[str] = Field(default=None, description="Sanitized error description if failed")
     activated_at: datetime = Field(default_factory=utc_now)
+    activated_source_retrieved: Optional[bool] = Field(default=None, description="Whether authentic activated DDL was retrieved from SAP DEV")
+    extraction_refresh_status: Optional[str] = Field(default=None, description="Status of I_DataExtractionEnabledView refresh")
+    extraction_enabled_confirmed: Optional[bool] = Field(default=None, description="Whether SAP reports the view as extraction enabled post-activation")
+    post_activation_status: Optional[str] = Field(default=None, description="Canonical post-activation status (e.g. EXTRACTION_ENABLED_VERIFIED)")
 
 
 class CDSWorkflowState(TypedDict, total=False):

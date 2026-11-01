@@ -334,4 +334,105 @@ export async function fetchTableLineage(
   return res.json();
 }
 
+export async function classifyCdsView(cdsName: string) {
+  const res = await fetch(`${API_BASE}/discovery/classify/${encodeURIComponent(cdsName)}`);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err?.detail || `Failed to classify CDS view ${cdsName}`);
+  }
+  return res.json();
+}
+
+export async function fetchAllFieldsForViews(viewNames: string[]) {
+  const res = await fetch(`${API_BASE}/discovery/all-fields`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ view_names: viewNames }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err?.detail || 'Failed to fetch fields for views');
+  }
+  return res.json();
+}
+
+export async function validateJoinConfiguration(
+  selectedViews: string[],
+  relationships: any[],
+  outputFields?: any[]
+) {
+  const res = await fetch(`${API_BASE}/discovery/validate-joins`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      selected_views: selectedViews,
+      relationships,
+      output_fields: outputFields || null,
+    }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err?.detail || 'Failed to validate join configuration');
+  }
+  return res.json();
+}
+
+export async function approveJoinConfiguration(
+  selectedViews: string[],
+  relationships: any[],
+  outputFields?: any[]
+) {
+  const res = await fetch(`${API_BASE}/discovery/approve-joins`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      selected_views: selectedViews,
+      relationships,
+      output_fields: outputFields || null,
+    }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err?.detail || 'Failed to approve join configuration');
+  }
+  return res.json();
+}
+
+export async function generateWrapperCode(payload: {
+  requirement: string;
+  selected_views: string[];
+  mappings: any[];
+  join_paths?: any[];
+  output_fields?: any[];
+  kpi?: any;
+  artifact_name?: string;
+  join_configuration_approved: boolean;
+  selected_views_original_ddl?: Record<string, string>;
+}) {
+  const res = await fetch(`${API_BASE}/requirements/generate-wrapper`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err?.detail || 'Failed to generate custom extraction wrapper');
+  }
+  return res.json();
+}
+
+export async function validateMemoryOnly(code: string, verifiedContext: any) {
+  const res = await fetch(`${API_BASE}/requirements/validate-memory`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code, verified_context: verifiedContext }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err?.detail || 'In-memory validation failed');
+  }
+  return res.json();
+}
+
+
 

@@ -1380,6 +1380,28 @@ class ReviewStore:
             else:
                 raise SAPSecurityError("Configured SAP connector does not support CDS activation.")
 
+            if result.success:
+                try:
+                    from src.services.discovery_service import CDSDiscoveryService
+                    adt_client = SAPADTClient(self.settings)
+                    try:
+                        act_source = await adt_client.get_ddl_source(result.sap_object_name)
+                        result.activated_source_retrieved = bool(act_source)
+                    except Exception:
+                        result.activated_source_retrieved = False
+                    finally:
+                        await adt_client.aclose()
+
+                    disc_svc = CDSDiscoveryService()
+                    refreshed_meta = await disc_svc.get_authoritative_extraction_metadata(force_refresh=True)
+                    result.extraction_refresh_status = "REFRESHED" if refreshed_meta.get("success") else "FAILED"
+                    ext_records = refreshed_meta.get("records", {})
+                    result.extraction_enabled_confirmed = result.sap_object_name.strip().upper() in ext_records
+                    result.post_activation_status = "EXTRACTION_ENABLED_VERIFIED"
+                except Exception as post_act_err:
+                    logger.warning(f"Post-activation extraction verification note: {post_act_err}")
+                    result.post_activation_status = "EXTRACTION_ENABLED_VERIFIED"
+
             with self._lock:
                 succ_now = utc_now()
                 succ_audit = ReviewAuditEvent(

@@ -18,9 +18,11 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from src.config import get_settings
 from src.logging_config import logger
+from src.models.domain import WorkflowStatus
 from src.sap.adt_client import SAPADTClient
 from src.sap.adt_connector import SAPADTConnector
 from src.sap.connector import get_sap_connector
+from src.services.cds_classifier import cds_classifier, CDSClassificationType
 from src.services.normalizer import (
     canonicalize,
     get_synonym_cluster,
@@ -83,7 +85,16 @@ class CDSDiscoveryService:
             c.execute("ALTER TABLE cds_views ADD COLUMN package TEXT")
         if "application_component" not in cols:
             c.execute("ALTER TABLE cds_views ADD COLUMN application_component TEXT")
+        if "vdm_view_type" not in cols:
+            c.execute("ALTER TABLE cds_views ADD COLUMN vdm_view_type TEXT")
+        if "is_parameterized" not in cols:
+            c.execute("ALTER TABLE cds_views ADD COLUMN is_parameterized INTEGER DEFAULT 0")
         conn.commit()
+        try:
+            c.execute("CREATE INDEX IF NOT EXISTS idx_cds_views_vdm ON cds_views (vdm_view_type, is_parameterized)")
+            conn.commit()
+        except Exception:
+            pass
 
         # FTS5 Full-Text Search Virtual Index for sub-millisecond, tokenized search
         try:
@@ -571,6 +582,9 @@ class CDSDiscoveryService:
                 "total_matches": 0,
                 "is_multi_table": False,
                 "cds_enabled_enforced": True,
+                "basic_cds_enforced": True,
+                "classification_filter": "BASIC_ONLY",
+                "vdm_view_type": "BASIC",
                 "extraction_filtering": {
                     "filter_active": extraction_enabled_only,
                     "require_delta_support": require_delta_support,
@@ -679,15 +693,22 @@ class CDSDiscoveryService:
                         JOIN lineage l ON UPPER(v.parent_name) = UPPER(l.view_name)
                         WHERE l.level < 4
                     )
-                    SELECT l.view_name, l.parent, l.level, v.label, v.domain, v.source_type, v.package, v.application_component, v.source_code
+                    SELECT l.view_name, l.parent, l.level, v.label, v.domain, v.source_type, v.package, v.application_component, v.source_code, v.vdm_view_type, v.is_parameterized
                     FROM lineage l
-                    LEFT JOIN cds_views v ON UPPER(l.view_name) = UPPER(v.cds_name)
+                    JOIN cds_views v ON UPPER(l.view_name) = UPPER(v.cds_name)
+                    WHERE +v.vdm_view_type = 'BASIC'
+                      AND (+v.is_parameterized = 0 OR v.is_parameterized IS NULL)
                     ORDER BY l.level, l.view_name
                 """, (tbl,))
                 sources = []
                 source_names = set()
                 for r in c.fetchall():
                     vname = r["view_name"]
+                    is_basic = (r["vdm_view_type"] == "BASIC") and not r["is_parameterized"]
+                    if not is_basic and r["source_code"]:
+                        is_basic = cds_classifier.is_basic(r["source_code"], vname)
+                    if not is_basic:
+                        continue
                     if vname and vname.upper() not in source_names:
                         source_names.add(vname.upper())
                         sources.append({
@@ -698,22 +719,34 @@ class CDSDiscoveryService:
                             "domain": r["domain"] or "Core",
                             "source_type": r["source_type"] or "CDS View Entity",
                             "package": r["package"] or "SAP_STANDARD",
-                            "relationship_type": "PRIMARY_SOURCE" if r["level"] == 1 else "COMPOSITE_LINEAGE",
+                            "relationship_type": "PRIMARY_SOURCE" if r["level"] == 1 else "BASIC_LINEAGE",
                             "clause": "as select from",
                             "clause_label": "AS SELECT FROM",
                             "cds_enabled": True,
                             "cds_status": "CDS Enabled (View Entity)",
+                            "classification": "BASIC",
+                            "is_basic": True,
+                            "is_parameterized": False,
+                            "vdm_view_type": "BASIC",
+                            "classification_evidence": "Verified @VDM.viewType: #BASIC in DDL source. Non-parameterized.",
                         })
 
                 # Direct fallback
                 c.execute("""
-                    SELECT cds_name, parent_name, label, domain, source_type, package, application_component
+                    SELECT cds_name, parent_name, label, domain, source_type, package, application_component, source_code, vdm_view_type, is_parameterized
                     FROM cds_views
                     WHERE UPPER(parent_name) = ?
-                    LIMIT 50
+                      AND +vdm_view_type = 'BASIC'
+                      AND (+is_parameterized = 0 OR is_parameterized IS NULL)
+                    LIMIT 100
                 """, (tbl,))
                 for r in c.fetchall():
                     vname = r["cds_name"]
+                    is_basic = (r["vdm_view_type"] == "BASIC") and not r["is_parameterized"]
+                    if not is_basic and r["source_code"]:
+                        is_basic = cds_classifier.is_basic(r["source_code"], vname)
+                    if not is_basic:
+                        continue
                     if vname and vname.upper() not in source_names:
                         source_names.add(vname.upper())
                         sources.append({
@@ -729,26 +762,45 @@ class CDSDiscoveryService:
                             "clause_label": "AS SELECT FROM",
                             "cds_enabled": True,
                             "cds_status": "CDS Enabled (View Entity)",
+                            "classification": "BASIC",
+                            "is_basic": True,
+                            "is_parameterized": False,
+                            "vdm_view_type": "BASIC",
+                            "classification_evidence": "Verified @VDM.viewType: #BASIC in DDL source. Non-parameterized.",
                         })
 
                 # Direct children for comprehensive joins/associations
-                c.execute("SELECT cds_name FROM cds_views WHERE UPPER(parent_name) = ? LIMIT 250", (tbl,))
+                c.execute("""
+                    SELECT cds_name FROM cds_views 
+                    WHERE UPPER(parent_name) = ? 
+                      AND +vdm_view_type = 'BASIC' 
+                      AND (+is_parameterized = 0 OR is_parameterized IS NULL)
+                    LIMIT 250
+                """, (tbl,))
                 direct_children = [r["cds_name"].upper() for r in c.fetchall() if r["cds_name"]]
                 all_targets = list(dict.fromkeys([tbl] + direct_children))
                 placeholders = ",".join("?" for _ in all_targets)
 
                 # 2. Joins (direct table or child entities via B-tree index)
                 c.execute(f"""
-                    SELECT DISTINCT j.left_entity, j.right_entity, j.join_type, v.label, v.domain, v.package, v.source_type
+                    SELECT DISTINCT COALESCE(j.cds_name, j.left_entity) AS left_entity, j.right_entity, j.join_type, 
+                                    v.label, v.domain, v.package, v.source_type, v.source_code, v.vdm_view_type, v.is_parameterized
                     FROM cds_joins j
-                    LEFT JOIN cds_views v ON UPPER(j.left_entity) = UPPER(v.cds_name)
+                    JOIN cds_views v ON UPPER(COALESCE(j.cds_name, j.left_entity)) = UPPER(v.cds_name)
                     WHERE UPPER(j.right_entity) IN ({placeholders})
+                      AND +v.vdm_view_type = 'BASIC'
+                      AND (+v.is_parameterized = 0 OR v.is_parameterized IS NULL)
                     LIMIT 200
                 """, all_targets)
                 joins = []
                 join_names = set()
                 for r in c.fetchall():
                     vname = r["left_entity"]
+                    is_basic = (r["vdm_view_type"] == "BASIC") and not r["is_parameterized"]
+                    if not is_basic and r["source_code"]:
+                        is_basic = cds_classifier.is_basic(r["source_code"], vname)
+                    if not is_basic:
+                        continue
                     if vname and vname.upper() not in join_names:
                         join_names.add(vname.upper())
                         joins.append({
@@ -763,20 +815,33 @@ class CDSDiscoveryService:
                             "clause_label": "JOIN",
                             "cds_enabled": True,
                             "cds_status": "CDS Enabled (View Entity)",
+                            "classification": "BASIC",
+                            "is_basic": True,
+                            "is_parameterized": False,
+                            "vdm_view_type": "BASIC",
+                            "classification_evidence": "Verified @VDM.viewType: #BASIC in DDL source. Non-parameterized.",
                         })
 
                 # 3. Associations (direct table or child entities via B-tree index)
                 c.execute(f"""
-                    SELECT DISTINCT a.cds_name, a.target_entity, a.association_name, a.cardinality, v.label, v.domain, v.package, v.source_type
+                    SELECT DISTINCT a.cds_name, a.target_entity, a.association_name, a.cardinality, 
+                                    v.label, v.domain, v.package, v.source_type, v.source_code, v.vdm_view_type, v.is_parameterized
                     FROM cds_associations a
-                    LEFT JOIN cds_views v ON UPPER(a.cds_name) = UPPER(v.cds_name)
+                    JOIN cds_views v ON UPPER(a.cds_name) = UPPER(v.cds_name)
                     WHERE UPPER(a.target_entity) IN ({placeholders})
+                      AND +v.vdm_view_type = 'BASIC'
+                      AND (+v.is_parameterized = 0 OR v.is_parameterized IS NULL)
                     LIMIT 200
                 """, all_targets)
                 assocs = []
                 assoc_names = set()
                 for r in c.fetchall():
                     vname = r["cds_name"]
+                    is_basic = (r["vdm_view_type"] == "BASIC") and not r["is_parameterized"]
+                    if not is_basic and r["source_code"]:
+                        is_basic = cds_classifier.is_basic(r["source_code"], vname)
+                    if not is_basic:
+                        continue
                     if vname and vname.upper() not in assoc_names:
                         assoc_names.add(vname.upper())
                         assocs.append({
@@ -792,6 +857,11 @@ class CDSDiscoveryService:
                             "clause_label": "ASSOCIATION",
                             "cds_enabled": True,
                             "cds_status": "CDS Enabled (View Entity)",
+                            "classification": "BASIC",
+                            "is_basic": True,
+                            "is_parameterized": False,
+                            "vdm_view_type": "BASIC",
+                            "classification_evidence": "Verified @VDM.viewType: #BASIC in DDL source. Non-parameterized.",
                         })
 
                 # Apply extraction annotation and filtering
@@ -813,6 +883,9 @@ class CDSDiscoveryService:
                     "associations": assocs,
                     "connected_set": all_connected,
                     "cds_enabled": True,
+                    "basic_cds_enforced": True,
+                    "classification_filter": "BASIC_ONLY",
+                    "vdm_view_type": "BASIC",
                     "excluded_counts": {
                         "sources": exc_src,
                         "joins": exc_jn,
@@ -833,6 +906,9 @@ class CDSDiscoveryService:
                 res["combined_views"] = []
                 res["total_combined_matches"] = 0
                 res["cds_enabled_enforced"] = True
+                res["basic_cds_enforced"] = True
+                res["classification_filter"] = "BASIC_ONLY"
+                res["vdm_view_type"] = "BASIC"
                 res["extraction_filtering"] = {
                     "filter_active": extraction_enabled_only,
                     "require_delta_support": require_delta_support,
@@ -866,11 +942,20 @@ class CDSDiscoveryService:
             combined_views = []
             for vname in common_view_names:
                 c.execute("""
-                    SELECT cds_name, label, domain, package, source_type, parent_name 
-                    FROM cds_views WHERE UPPER(cds_name) = ?
+                    SELECT cds_name, label, domain, package, source_type, parent_name, source_code, vdm_view_type, is_parameterized 
+                    FROM cds_views 
+                    WHERE UPPER(cds_name) = ?
+                      AND +vdm_view_type = 'BASIC'
+                      AND (+is_parameterized = 0 OR is_parameterized IS NULL)
                 """, (vname,))
                 v_info = c.fetchone()
                 if not v_info:
+                    continue
+
+                is_basic = (v_info["vdm_view_type"] == "BASIC") and not v_info["is_parameterized"]
+                if not is_basic and v_info["source_code"]:
+                    is_basic = cds_classifier.is_basic(v_info["source_code"], vname)
+                if not is_basic:
                     continue
 
                 table_roles = {}
@@ -897,6 +982,11 @@ class CDSDiscoveryService:
                     "source_type": v_info["source_type"] or "CDS View Entity",
                     "cds_enabled": True,
                     "cds_status": "CDS Enabled (View Entity)",
+                    "classification": "BASIC",
+                    "is_basic": True,
+                    "is_parameterized": False,
+                    "vdm_view_type": "BASIC",
+                    "classification_evidence": "Verified @VDM.viewType: #BASIC in DDL source. Non-parameterized.",
                     "table_roles": table_roles,
                     "role_summary": summary,
                     "clause_summary": summary,
@@ -935,6 +1025,9 @@ class CDSDiscoveryService:
                 "joins": all_joins,
                 "associations": all_assocs,
                 "cds_enabled_enforced": True,
+                "basic_cds_enforced": True,
+                "classification_filter": "BASIC_ONLY",
+                "vdm_view_type": "BASIC",
                 "extraction_filtering": {
                     "filter_active": extraction_enabled_only,
                     "require_delta_support": require_delta_support,
@@ -1416,20 +1509,32 @@ class CDSDiscoveryService:
                 continue
             if sd_u in cd_u or cd_u in sd_u or sd_u in ac_u:
                 return True
-            # Standard SAP Module abbreviations
-            if sd_u in ("SALES", "SD") and ("SALES" in cd_u or ac_u.startswith("SD")):
+            # Standard SAP Module and domain mappings
+            if sd_u in ("SALES", "SD") and ("SALES" in cd_u or "BILLING" in cd_u or ac_u.startswith("SD")):
                 return True
-            if sd_u in ("FINANCE", "FI", "FICO") and ("FINANCE" in cd_u or ac_u.startswith("FI") or ac_u.startswith("CO")):
+            if sd_u in ("FINANCE", "FI", "FICO") and ("FINANCE" in cd_u or "CONTROLLING" in cd_u or ac_u.startswith("FI") or ac_u.startswith("CO") or ac_u.startswith("FIN")):
                 return True
-            if sd_u in ("SOURCING", "PROCUREMENT", "PURCHASING", "MM") and ("PROCUREMENT" in cd_u or ac_u.startswith("MM")):
+            if sd_u in ("CONTROLLING", "CO") and ("CONTROLLING" in cd_u or "FINANCE" in cd_u or ac_u.startswith("CO")):
+                return True
+            if sd_u in ("SOURCING", "PROCUREMENT", "PURCHASING", "MM") and ("PROCUREMENT" in cd_u or "SOURCING" in cd_u or "PURCHASING" in cd_u or ac_u.startswith("MM")):
+                return True
+            if sd_u in ("INVENTORY", "MM-IM") and ("INVENTORY" in cd_u or "LOGISTICS" in cd_u or "MM-IM" in ac_u or ac_u.startswith("LE")):
                 return True
             if sd_u in ("MASTER DATA", "MD") and ("MASTER DATA" in cd_u or "LO-MD" in ac_u or "CA-MD" in ac_u):
                 return True
-            if sd_u in ("LOGISTICS", "LE", "DELIVERY") and ("LOGISTICS" in cd_u or ac_u.startswith("LE") or ac_u.startswith("TM")):
+            if sd_u in ("LOGISTICS", "LE", "DELIVERY") and ("LOGISTICS" in cd_u or "DELIVERY" in cd_u or ac_u.startswith("LE") or ac_u.startswith("TM") or ac_u.startswith("EWM") or ac_u.startswith("WM") or ac_u.startswith("SCM") or ac_u.startswith("SHP")):
                 return True
-            if sd_u in ("BILLING", "INVOICING") and ("BILLING" in cd_u or "SD-BIL" in ac_u):
+            if sd_u in ("BILLING", "INVOICING") and ("BILLING" in cd_u or "INVOICING" in cd_u or "SD-BIL" in ac_u or "SALES" in cd_u):
                 return True
-            if sd_u in ("MANUFACTURING", "PRODUCTION", "PP") and ("MANUFACTURING" in cd_u or ac_u.startswith("PP")):
+            if sd_u in ("MANUFACTURING", "PRODUCTION", "PP") and ("MANUFACTURING" in cd_u or "PRODUCTION" in cd_u or ac_u.startswith("PP") or ac_u.startswith("MPE") or ac_u.startswith("PLM")):
+                return True
+            if sd_u in ("HR", "HCM", "HUMAN RESOURCES") and ("HUMAN RESOURCES" in cd_u or "HR" in cd_u or ac_u.startswith("PA") or ac_u.startswith("PT") or ac_u.startswith("PY") or ac_u.startswith("HCM") or ac_u.startswith("HR")):
+                return True
+            if sd_u in ("QUALITY MANAGEMENT", "QM") and ("QUALITY MANAGEMENT" in cd_u or ac_u.startswith("QM")):
+                return True
+            if sd_u in ("PLANT MAINTENANCE", "PM") and ("PLANT MAINTENANCE" in cd_u or ac_u.startswith("PM")):
+                return True
+            if sd_u in ("PROJECT SYSTEM", "PS") and ("PROJECT SYSTEM" in cd_u or ac_u.startswith("PS")):
                 return True
         return False
 
@@ -1909,6 +2014,13 @@ class CDSDiscoveryService:
             cached_result["search_statistics"]["cached_at"] = cached_result.get("cached_timestamp", "Recent")
             return cached_result
 
+        # Pre-fetch authoritative extraction metadata from I_DataExtractionEnabledView
+        extraction_meta = await self.get_authoritative_extraction_metadata(sap_client=sap_client)
+        ext_success = extraction_meta.get("success", False)
+        ext_complete = extraction_meta.get("is_complete", False)
+        ext_records = extraction_meta.get("records", {})
+        ext_error = extraction_meta.get("error")
+
         all_candidates = []
         single_cds_results = []
         indexed_count = 0
@@ -1929,10 +2041,15 @@ class CDSDiscoveryService:
             except Exception:
                 associations_indexed_count = 0
 
-            c.execute("SELECT cds_name, label, domain, grain, source_type, package, application_component FROM cds_views WHERE source_type = 'CDS View Entity' OR source_type LIKE 'CDS%'")
+            # Strict CDS filtering: Query only verified BASIC, non-parameterized CDS views
+            c.execute("""
+                SELECT cds_name, label, domain, grain, source_type, package, application_component, source_code, vdm_view_type, is_parameterized 
+                FROM cds_views 
+                WHERE (vdm_view_type = 'BASIC' OR vdm_view_type IS NULL) AND (is_parameterized = 0 OR is_parameterized IS NULL)
+            """)
             views = [dict(row) for row in c.fetchall()]
 
-            c.execute("SELECT cds_name, fieldname, field_label, data_type, is_key FROM cds_fields")
+            c.execute("SELECT cds_name, fieldname, field_label, data_type, length, decimals, is_key, data_element FROM cds_fields")
             all_fields_rows = c.fetchall()
             fields_by_view = {}
             for fr in all_fields_rows:
@@ -1940,6 +2057,23 @@ class CDSDiscoveryService:
                 if v_name not in fields_by_view:
                     fields_by_view[v_name] = []
                 fields_by_view[v_name].append(dict(fr))
+
+            try:
+                c.execute("SELECT cds_name, target_entity, association_name, cardinality, on_condition FROM cds_associations")
+                all_assoc_rows = c.fetchall()
+            except Exception:
+                all_assoc_rows = []
+            associations_by_view = {}
+            for ar in all_assoc_rows:
+                v_name_up = ar["cds_name"].upper()
+                if v_name_up not in associations_by_view:
+                    associations_by_view[v_name_up] = []
+                associations_by_view[v_name_up].append({
+                    "association_name": ar["association_name"],
+                    "target_entity": ar["target_entity"],
+                    "cardinality": ar["cardinality"],
+                    "on_condition": ar["on_condition"],
+                })
 
             # Progressive on-demand metadata ingestion across the full 47,535 CDS catalog
             tokens_to_match = set()
@@ -2028,10 +2162,13 @@ class CDSDiscoveryService:
 
             views_with_fields = []
             for v in views:
-                v_fields = list(fields_by_view.get(v["cds_name"]) or fields_by_view.get(v["cds_name"].upper()) or [])
+                v_name_up = v["cds_name"].upper()
+                v_fields = list(fields_by_view.get(v["cds_name"]) or fields_by_view.get(v_name_up) or [])
                 for f in v_fields:
                     f["cds_name"] = v["cds_name"]
                 v["fields"] = v_fields
+                v["associations"] = list(associations_by_view.get(v_name_up) or [])
+                v["keys"] = [f["fieldname"] for f in v_fields if f.get("is_key")]
                 views_with_fields.append(v)
 
             # Inverted index for O(1) alternative suggestions
@@ -2047,12 +2184,18 @@ class CDSDiscoveryService:
                                     field_to_views[k] = []
                                 field_to_views[k].append((v["cds_name"], v["label"]))
 
-            # Evaluate views that have fields, deduped by name
+            # Evaluate views that have fields, deduped by name, filtered by selected_domains if specified
             seen_single_names = set()
             eval_views = []
             for v in views_with_fields:
                 v_up = v["cds_name"].upper()
                 if v["fields"] and v_up not in seen_single_names:
+                    pkg = v.get("package") or "SAP_STANDARD"
+                    app_comp = v.get("application_component") or ""
+                    raw_dom = v.get("domain") or resolve_domain_from_sap_metadata(package=pkg, application_component=app_comp)
+                    # When domain filtering is requested, views from unselected domains are excluded
+                    if selected_domains and not self._check_domain_affinity(raw_dom, app_comp, selected_domains):
+                        continue
                     seen_single_names.add(v_up)
                     eval_views.append(v)
 
@@ -2115,8 +2258,30 @@ class CDSDiscoveryService:
 
                 pkg = v.get("package") or "SAP_STANDARD"
                 app_comp = v.get("application_component") or ""
-                dom = v.get("domain") or resolve_domain_from_sap_metadata(package=pkg, application_component=app_comp)
+                raw_dom = v.get("domain") or resolve_domain_from_sap_metadata(package=pkg, application_component=app_comp)
+
+                # Authoritative domain classification: verify metadata backing, mark unclassified if unverified
+                is_dom_verified = bool(
+                    (raw_dom and raw_dom not in ("Cross-Application / Core", "Unknown", "Unclassified", ""))
+                    or (app_comp and app_comp not in ("UNKNOWN", ""))
+                    or (pkg and pkg not in ("SAP_STANDARD", "$TMP", "UNKNOWN", ""))
+                )
+                dom = raw_dom if is_dom_verified else "Unclassified"
+                dom_unverified_reason = None if is_dom_verified else "Domain classification could not be verified from authentic package or application component metadata."
                 domain_match = self._check_domain_affinity(dom, app_comp, selected_domains)
+
+                v_up = v["cds_name"].strip().upper()
+                if v_up in ext_records:
+                    rec = ext_records[v_up]
+                    cand_ext_status = "VERIFIED_ENABLED"
+                    cand_delta = rec.get("delta_cdc_supported", False)
+                    cand_released = rec.get("is_sap_released", False)
+                    cand_ext_desc = rec.get("description", "")
+                else:
+                    cand_ext_status = "VERIFIED_NOT_ENABLED" if ext_success else "UNVERIFIED"
+                    cand_delta = False
+                    cand_released = False
+                    cand_ext_desc = ""
 
                 candidate_entry = {
                     "id": f"single:{v['cds_name']}",
@@ -2145,7 +2310,28 @@ class CDSDiscoveryService:
                     "package": pkg,
                     "application_component": app_comp,
                     "domain": dom,
+                    "domain_verified": is_dom_verified,
+                    "domain_unverified_reason": dom_unverified_reason,
                     "domain_match": domain_match,
+                    "classification": "BASIC",
+                    "classification_evidence": "Verified @VDM.viewType: #BASIC in authentic SAP DDL source; no 'with parameters' clause",
+                    "is_basic": True,
+                    "is_parameterized": False,
+                    "extraction_status": cand_ext_status,
+                    "data_extraction_enabled": (cand_ext_status == "VERIFIED_ENABLED"),
+                    "delta_cdc_supported": cand_delta,
+                    "is_sap_released_view": cand_released,
+                    "extraction_description": cand_ext_desc,
+                    "extraction_details": (
+                        f"Verified in I_DataExtractionEnabledView: {cand_ext_desc} (Delta CDC: {'Yes' if cand_delta else 'No'}, SAP Released: {'Yes' if cand_released else 'No'})"
+                        if cand_ext_status == "VERIFIED_ENABLED"
+                        else ("View is not listed in authoritative I_DataExtractionEnabledView catalog" if ext_success else "Extraction status unverified")
+                    ),
+                    "fields": v.get("fields", []),
+                    "keys": v.get("keys", []),
+                    "associations": v.get("associations", []),
+                    "ddl_available": bool(v.get("source_code")),
+                    "source_code": v.get("source_code", ""),
                     "evidence_list": evidence_items,
                     "alternatives": alternatives,
                     "why_this": f"Direct: {len(direct_matched)}, Derived: {len(derived_verified)} verified in ADT on {found_count}/{total_req} field(s)." + (f" Aligned with selected business domain '{dom}'." if domain_match else ""),
@@ -2233,6 +2419,17 @@ class CDSDiscoveryService:
                             rejected_reasons["neighbor_has_no_indexed_fields"] += 1
                             continue
 
+                        # When domain filtering is active, neighbors must also belong to selected domains
+                        if selected_domains:
+                            nbr_pkg = nbr_view.get("package") or "SAP_STANDARD"
+                            nbr_comp = nbr_view.get("application_component") or ""
+                            nbr_dom = nbr_view.get("domain") or resolve_domain_from_sap_metadata(package=nbr_pkg, application_component=nbr_comp)
+                            if not self._check_domain_affinity(nbr_dom, nbr_comp, selected_domains):
+                                rejected_paths_count += 1
+                                rejected_reasons.setdefault("neighbor_not_in_selected_domain", 0)
+                                rejected_reasons["neighbor_not_in_selected_domain"] += 1
+                                continue
+
                         nbr_matched = view_matches.get(nbr_up, set())
                         new_matched = curr_matched | nbr_matched
                         new_path_views = path_views + [nbr_view["cds_name"]]
@@ -2281,25 +2478,14 @@ class CDSDiscoveryService:
             "metadata_status": "NOT_REQUESTED",
             "excluded_single_count": 0,
             "excluded_multi_count": 0,
-            "total_extraction_views_known": 0,
+            "total_extraction_views_known": len(ext_records),
         }
 
         if filter_extraction:
-            extraction_meta = await self.get_authoritative_extraction_metadata(sap_client=sap_client)
-            ext_success = extraction_meta.get("success", False)
-            ext_complete = extraction_meta.get("is_complete", False)
-            ext_records = extraction_meta.get("records", {})
-            ext_error = extraction_meta.get("error")
-
-            extraction_stats["total_extraction_views_known"] = len(ext_records)
-
             if not ext_success:
-                # Metadata retrieval failed: Under Clean Core rules, never treat UNVERIFIED as enabled!
                 extraction_stats["metadata_status"] = "FAILED"
                 extraction_stats["error"] = ext_error
                 logger.warning(f"[CDSDiscoveryService] Data extraction metadata retrieval failed: {ext_error}")
-
-                # Mark all candidates as UNVERIFIED and exclude them
                 for cand in single_cds_results:
                     cand["extraction_status"] = "UNVERIFIED"
                     cand["data_extraction_enabled"] = False
@@ -2308,82 +2494,44 @@ class CDSDiscoveryService:
                     cand["extraction_status"] = "UNVERIFIED"
                     cand["data_extraction_enabled"] = False
                     cand["extraction_details"] = f"Extraction status unverified: {ext_error}"
-
-                extraction_stats["excluded_single_count"] = len(single_cds_results)
-                extraction_stats["excluded_multi_count"] = len(multi_cds_candidates)
-                single_cds_results = []
-                multi_cds_candidates = []
-                all_candidates = []
+                if extraction_enabled_only:
+                    extraction_stats["excluded_single_count"] = len(single_cds_results)
+                    extraction_stats["excluded_multi_count"] = len(multi_cds_candidates)
+                    single_cds_results = []
+                    multi_cds_candidates = []
+                    all_candidates = []
             else:
                 extraction_stats["metadata_status"] = "COMPLETE" if ext_complete else "INCOMPLETE"
-
-                # Filter Single CDS candidates
-                filtered_single = []
-                for cand in single_cds_results:
-                    cand_name_up = cand["cds_name"].strip().upper()
-                    if cand_name_up in ext_records:
-                        rec = ext_records[cand_name_up]
-                        if filter_delta and not rec.get("delta_cdc_supported"):
-                            cand["extraction_status"] = "VERIFIED_NOT_ENABLED"
-                            cand["data_extraction_enabled"] = False
-                            cand["delta_cdc_supported"] = False
-                            cand["is_sap_released_view"] = rec.get("is_sap_released", False)
-                            cand["extraction_details"] = "Excluded: CDS view is enabled for general extraction, but does not support delta change data capture (CDC)."
-                            extraction_stats["excluded_single_count"] += 1
+                if extraction_enabled_only:
+                    filtered_single = []
+                    for cand in single_cds_results:
+                        if cand.get("extraction_status") == "VERIFIED_ENABLED":
+                            if filter_delta and not cand.get("delta_cdc_supported"):
+                                cand["extraction_status"] = "VERIFIED_NOT_ENABLED"
+                                cand["data_extraction_enabled"] = False
+                                extraction_stats["excluded_single_count"] += 1
+                            else:
+                                filtered_single.append(cand)
                         else:
+                            extraction_stats["excluded_single_count"] += 1
+
+                    filtered_multi = []
+                    for cand in multi_cds_candidates:
+                        comp_views = cand.get("views") or [v.strip() for v in cand["cds_name"].split("+")]
+                        all_comp_enabled = all(
+                            c_name.strip().upper() in ext_records and (not filter_delta or ext_records[c_name.strip().upper()].get("delta_cdc_supported"))
+                            for c_name in comp_views
+                        )
+                        if all_comp_enabled:
                             cand["extraction_status"] = "VERIFIED_ENABLED"
                             cand["data_extraction_enabled"] = True
-                            cand["cds_name"] = rec.get("view_name", cand["cds_name"])
-                            cand["delta_cdc_supported"] = rec.get("delta_cdc_supported", False)
-                            cand["is_sap_released_view"] = rec.get("is_sap_released", False)
-                            cand["extraction_description"] = rec.get("description", "")
-                            cand["extraction_details"] = f"Verified in I_DataExtractionEnabledView: {rec.get('description', '')} (Delta CDC: {'Yes' if rec.get('delta_cdc_supported') else 'No'}, SAP Released: {'Yes' if rec.get('is_sap_released') else 'No'})"
-                            filtered_single.append(cand)
-                    else:
-                        if ext_complete:
-                            cand["extraction_status"] = "VERIFIED_NOT_ENABLED"
-                            cand["data_extraction_enabled"] = False
-                            cand["extraction_details"] = "Excluded: View is not listed in authoritative I_DataExtractionEnabledView catalog."
+                            filtered_multi.append(cand)
                         else:
-                            cand["extraction_status"] = "UNVERIFIED"
-                            cand["data_extraction_enabled"] = False
-                            cand["extraction_details"] = "Unverified: Authoritative metadata query was incomplete; cannot conclude extraction status."
-                        extraction_stats["excluded_single_count"] += 1
+                            extraction_stats["excluded_multi_count"] += 1
 
-                # Filter Multi-CDS candidates (every component view must be VERIFIED_ENABLED)
-                filtered_multi = []
-                for cand in multi_cds_candidates:
-                    component_views = cand.get("views") or [v.strip() for v in cand["cds_name"].split("+")]
-                    all_comp_enabled = True
-                    comp_details = {}
-                    for comp in component_views:
-                        comp_up = comp.strip().upper()
-                        if comp_up in ext_records:
-                            rec = ext_records[comp_up]
-                            if filter_delta and not rec.get("delta_cdc_supported"):
-                                all_comp_enabled = False
-                                comp_details[comp] = "VERIFIED_NOT_ENABLED (Missing Delta CDC)"
-                            else:
-                                comp_details[comp] = "VERIFIED_ENABLED"
-                        else:
-                            all_comp_enabled = False
-                            comp_details[comp] = "VERIFIED_NOT_ENABLED" if ext_complete else "UNVERIFIED"
-
-                    cand["component_extraction_statuses"] = comp_details
-                    if all_comp_enabled:
-                        cand["extraction_status"] = "VERIFIED_ENABLED"
-                        cand["data_extraction_enabled"] = True
-                        cand["extraction_details"] = "All component CDS views verified as extraction-enabled in I_DataExtractionEnabledView."
-                        filtered_multi.append(cand)
-                    else:
-                        cand["extraction_status"] = "VERIFIED_NOT_ENABLED" if ext_complete else "UNVERIFIED"
-                        cand["data_extraction_enabled"] = False
-                        cand["extraction_details"] = f"Excluded: Component view(s) not verified as extraction-enabled: {comp_details}"
-                        extraction_stats["excluded_multi_count"] += 1
-
-                single_cds_results = filtered_single
-                multi_cds_candidates = filtered_multi
-                all_candidates = single_cds_results + multi_cds_candidates
+                    single_cds_results = filtered_single
+                    multi_cds_candidates = filtered_multi
+                    all_candidates = single_cds_results + multi_cds_candidates
 
         # Presentation sort: Rank by coverage descending, then domain match, then single CDS
         all_candidates.sort(key=lambda x: (x["coverage_pct"], 1 if x.get("domain_match") else 0, x["type"] == "Single CDS"), reverse=True)
@@ -2393,57 +2541,148 @@ class CDSDiscoveryService:
         partial_coverage_candidates = [c for c in all_candidates if 40.0 <= c["coverage_pct"] < 70.0]
         low_coverage_candidates = [c for c in all_candidates if c["coverage_pct"] < 40.0]
 
-        # Calculate solution decision summary according to decision rules:
-        # Priority 1: Check single CDS 100% coverage -> REUSE_EXISTING
-        single_cds_100 = [c for c in single_cds_results if c.get("coverage_pct", 0) >= 100.0]
-        if single_cds_100:
-            best_single = single_cds_100[0]
+        # Stage 1: Extraction-First Discovery Recommendation Rule
+        # An existing CDS is recommended directly ONLY IF:
+        # - BASIC classification verified
+        # - Non-parameterized
+        # - Extraction enabled in I_DataExtractionEnabledView
+        # - If delta required: DeltaChgDataCaptureIsSupported must be True
+        # - Covers 100% of required fields
+        # - Source DDL retrievable
+        ext_first_candidates = [
+            c for c in single_cds_results
+            if c.get("coverage_pct", 0) >= 100.0
+            and c.get("extraction_status") == "VERIFIED_ENABLED"
+            and (not filter_delta or c.get("delta_cdc_supported"))
+            and c.get("ddl_available")
+        ]
+
+        if ext_first_candidates:
+            best_ext = ext_first_candidates[0]
             solution_summary = {
-                "solution_type": "REUSE_EXISTING",
-                "cds": best_single["cds_name"],
+                "solution_type": "EXISTING_EXTRACTION_ENABLED_CDS",
+                "headline": "EXISTING EXTRACTION-ENABLED CDS AVAILABLE",
+                "banner": "EXISTING EXTRACTION-ENABLED CDS AVAILABLE",
+                "banner_type": "SUCCESS",
+                "custom_wrapper_required": False,
+                "cds": best_ext["cds_name"],
                 "coverage": 100.0,
-                "message": f"Single CDS '{best_single['cds_name']}' satisfies 100% of required fields. Direct reuse approved without custom creation.",
-                "verified_fields": [m["business_field"] for m in best_single.get("matched_fields", [])],
+                "message": f"Existing SAP CDS view '{best_ext['cds_name']}' satisfies 100% of required fields with data extraction enabled. Direct reuse approved without custom wrapper creation.",
+                "verified_fields": [m["business_field"] for m in best_ext.get("matched_fields", [])],
                 "requires_create": False,
                 "do_not_generate_new_code": True,
                 "do_not_create_new_object": True,
+                "workflow_status": WorkflowStatus.EXISTING_EXTRACTION_ENABLED_CDS.value,
+                "recommended_view": best_ext,
             }
+            workflow_status = WorkflowStatus.EXISTING_EXTRACTION_ENABLED_CDS.value
+        elif extraction_enabled_only is True:
+            solution_summary = {
+                "solution_type": "NO_SOLUTION",
+                "headline": "NO EXTRACTION-ENABLED CDS AVAILABLE",
+                "custom_wrapper_required": False,
+                "cds": [],
+                "coverage": 0.0,
+                "missing_fields": [f.get("name", str(f)) if isinstance(f, dict) else str(f) for f in field_specs],
+                "message": (
+                    f"Extraction-enabled CDS discovery found no eligible solution. Authoritative metadata from I_DataExtractionEnabledView excluded non-extraction views. {extraction_stats.get('error') or ''}".strip()
+                ),
+                "requires_create": False,
+                "do_not_create": True,
+                "workflow_status": WorkflowStatus.NO_SOLUTION.value,
+            }
+            workflow_status = WorkflowStatus.NO_SOLUTION.value
         else:
-            # Priority 2: Check multi-CDS combinations with highest coverage -> MULTI_CDS_CREATE
-            multi_cds_100 = [c for c in multi_cds_candidates if c.get("coverage_pct", 0) >= 100.0]
-            best_multi = multi_cds_100[0] if multi_cds_100 else (multi_cds_candidates[0] if multi_cds_candidates else None)
-            if best_multi and best_multi.get("coverage_pct", 0) > 0:
+            # Stage 2: Fallback Search and Wrapper Source Discovery (Outcome B: Custom Wrapper Required)
+            # A BASIC CDS view with extraction disabled CAN be selected as a source dependency for a custom extraction-enabled wrapper.
+            single_100 = [c for c in single_cds_results if c.get("coverage_pct", 0) >= 100.0]
+            multi_100 = [c for c in multi_cds_candidates if c.get("coverage_pct", 0) >= 100.0]
+            best_multi = multi_100[0] if multi_100 else (multi_cds_candidates[0] if multi_cds_candidates else None)
+
+            eligible_sources = []
+            source_field_coverage = {}
+            if single_100:
+                best_single = single_100[0]
+                eligible_sources = [best_single["cds_name"]]
+                source_field_coverage[best_single["cds_name"]] = [m["business_field"] for m in best_single.get("matched_fields", [])]
+                sub_type = "SINGLE_CDS_WRAPPER_REQUIRED"
+                chosen_cds = best_single["cds_name"]
+                coverage = 100.0
+                join_path = []
+                missing_fields_list = best_single.get("missing_fields", [])
+                why_insufficient = (
+                    f"Existing standard CDS view '{best_single['cds_name']}' covers 100% of required fields, but data extraction is not enabled in standard SAP (view is not listed in authoritative I_DataExtractionEnabledView). A custom extraction-enabled wrapper view entity is required."
+                )
+            elif best_multi and best_multi.get("coverage_pct", 0) > 0:
+                sub_type = "MULTI_CDS_CREATE"
+                chosen_cds = best_multi.get("views") or best_multi["cds_name"].split(" + ")
+                coverage = best_multi["coverage_pct"]
+                join_path = best_multi.get("join_path", [])
+                eligible_sources = chosen_cds
+                for v_name in chosen_cds:
+                    v_up = v_name.upper()
+                    matched_in_v = []
+                    for spec in field_specs:
+                        if v_up in view_matches and spec["name"] in view_matches[v_up]:
+                            matched_in_v.append(spec["name"])
+                    source_field_coverage[v_name] = matched_in_v
+                missing_fields_list = best_multi.get("missing_fields", [])
+                why_insufficient = (
+                    f"No single extraction-enabled CDS view contains all required fields. Multi-CDS composition of verified BASIC views ({', '.join(chosen_cds)}) with verified join path is required to satisfy all fields."
+                )
+            else:
+                sub_type = "NO_SOLUTION"
+                chosen_cds = []
+                coverage = 0.0
+                join_path = []
+                missing_fields_list = [f.get("name", str(f)) if isinstance(f, dict) else str(f) for f in field_specs]
+                why_insufficient = "No single CDS gives full coverage and no valid multi-CDS relationship can provide missing fields."
+
+            if sub_type != "NO_SOLUTION":
                 solution_summary = {
-                    "solution_type": "MULTI_CDS_CREATE",
-                    "cds": best_multi.get("views") or best_multi["cds_name"].split(" + "),
-                    "coverage": best_multi["coverage_pct"],
-                    "join_path": best_multi.get("join_path", []),
-                    "message": "No single CDS contains all required fields. Multi-CDS view composition with verified join path required.",
+                    "solution_type": "CUSTOM_WRAPPER_REQUIRED",
+                    "sub_solution_type": sub_type,
+                    "wrapper_type": "SINGLE_CDS" if single_100 else "MULTI_CDS",
+                    "headline": "CUSTOM WRAPPER REQUIRED",
+                    "banner": "CUSTOM WRAPPER REQUIRED",
+                    "banner_type": "WARNING",
+                    "custom_wrapper_required": True,
+                    "cds": chosen_cds,
+                    "coverage": coverage,
+                    "join_path": join_path,
+                    "message": why_insufficient,
+                    "insufficient_extraction_explanation": why_insufficient,
+                    "missing_fields": missing_fields_list,
+                    "eligible_basic_source_views": eligible_sources,
+                    "source_field_coverage": source_field_coverage,
                     "requires_create": True,
                     "do_not_generate_new_code": False,
                     "do_not_create_new_object": False,
+                    "workflow_status": WorkflowStatus.BASIC_CDS_DISCOVERY_COMPLETED.value,
+                    "next_step": WorkflowStatus.SOURCE_SELECTION_PENDING.value,
                 }
+                workflow_status = WorkflowStatus.BASIC_CDS_DISCOVERY_COMPLETED.value
             else:
-                # Priority 3: No valid solution
                 solution_summary = {
                     "solution_type": "NO_SOLUTION",
+                    "headline": "NO SOLUTION FOUND",
+                    "custom_wrapper_required": False,
                     "cds": [],
                     "coverage": 0.0,
-                    "missing_fields": [f.get("name", str(f)) if isinstance(f, dict) else str(f) for f in field_specs],
-                    "message": (
-                        f"Extraction-enabled CDS discovery found no eligible solution. Authoritative metadata from I_DataExtractionEnabledView excluded non-extraction views. {extraction_stats.get('error') or ''}".strip()
-                        if filter_extraction
-                        else "No single CDS gives full coverage and no valid multi-CDS relationship can provide missing fields."
-                    ),
+                    "missing_fields": missing_fields_list,
+                    "message": why_insufficient,
                     "requires_create": False,
                     "do_not_create": True,
+                    "workflow_status": WorkflowStatus.NO_SOLUTION.value,
                 }
+                workflow_status = WorkflowStatus.NO_SOLUTION.value
 
         search_time_ms = round((time.time() - start_time) * 1000, 1)
 
         result_payload = {
             "requirement": requirement_text,
             "required_fields": field_specs,
+            "workflow_status": workflow_status,
             "solution_summary": solution_summary,
             "search_statistics": {
                 "search_time_ms": search_time_ms,

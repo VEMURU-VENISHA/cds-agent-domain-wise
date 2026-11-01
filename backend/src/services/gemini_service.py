@@ -21,6 +21,8 @@ CDS_GENERATION_SYSTEM_PROMPT = """You are an expert SAP ABAP CDS View Entity cod
 RULE 1: STRUCTURE — CDS DDL must follow this EXACT order:
   @AccessControl.authorizationCheck: #NOT_REQUIRED
   @EndUserText.label: '<label>'
+  @Analytics.dataExtraction.enabled: true
+  @Analytics.dataExtraction.delta.byElement.detectFilters: true
   @Metadata.ignorePropagatedAnnotations: true
   define view entity <Z_VIEW_NAME>
     as select from <PRIMARY_CDS> as _<ALIAS1>
@@ -69,6 +71,12 @@ RULE 9: 100% REQUIRED FIELD COVERAGE:
   - Use exact SAP technical field names from metadata. Prefix with correct source alias. Add 'as <BusinessName>' alias only if technical name differs.
 
 RULE 10: NO DUPLICATE ASSOCIATIONS OR FIELDS.
+
+RULE 11: EXTRACTION WRAPPER & ALL COLUMNS PROJECTION:
+  - For data extraction wrappers, include both:
+      @Analytics.dataExtraction.enabled: true
+      @Analytics.dataExtraction.delta.byElement.detectFilters: true
+  - Project all selected and mapped columns explicitly from the underlying view. Note: ABAP CDS View Entities do NOT allow 'select *'; each column must be listed explicitly, with key columns marked with 'key'.
 
 OUTPUT: Output ONLY the raw CDS DDL source code. No markdown code blocks. No explanation. Just the raw DDL starting with @AccessControl.
 """
@@ -759,6 +767,10 @@ Return JSON strictly conforming to this schema:
             header_anns.append("@AccessControl.authorizationCheck: #NOT_REQUIRED")
         if not _re.search(r"@EndUserText\.label", code, _re.IGNORECASE):
             header_anns.append(f"@EndUserText.label: '{clean_art}'")
+        if not _re.search(r"@Analytics\.dataExtraction\.enabled", code, _re.IGNORECASE):
+            header_anns.append("@Analytics.dataExtraction.enabled: true")
+        if not _re.search(r"@Analytics\.dataExtraction\.delta", code, _re.IGNORECASE):
+            header_anns.append("@Analytics.dataExtraction.delta.byElement.detectFilters: true")
         if not _re.search(r"@Metadata\.ignorePropagatedAnnotations", code, _re.IGNORECASE):
             header_anns.append("@Metadata.ignorePropagatedAnnotations: true")
 
@@ -1001,6 +1013,7 @@ Return JSON strictly conforming to this schema:
         code = f"""@Metadata.ignorePropagatedAnnotations: true
 @AccessControl.authorizationCheck: #NOT_REQUIRED
 @EndUserText.label: '{artifact_name}'
+@Analytics.dataExtraction.enabled: true
 define view entity {artifact_name}
   as select from {primary} as {primary_alias}"""
         if associations_ddl:
@@ -1072,14 +1085,16 @@ define view entity {artifact_name}
         # 1. Fetch FULL VERIFIED METADATA for EVERY selected CDS view from discovery service
         discovery_svc = CDSDiscoveryService()
         selected_views_full_metadata: Dict[str, Any] = {}
+        selected_views_ddl: Dict[str, str] = {}
         full_metadata_counts: Dict[str, Any] = {}
 
         for v in selected_views:
+            v_clean = v.strip().upper()
             try:
-                meta = await discovery_svc.get_view_details(v)
+                meta = await discovery_svc.get_view_details(v_clean)
                 if meta:
-                    selected_views_full_metadata[v] = meta
-                    full_metadata_counts[v] = {
+                    selected_views_full_metadata[v_clean] = meta
+                    full_metadata_counts[v_clean] = {
                         "fields_count": len(meta.get("fields", [])),
                         "keys_count": len(meta.get("keys", [])),
                         "associations_count": len(meta.get("associations", [])),
@@ -1087,26 +1102,40 @@ define view entity {artifact_name}
                         "package": meta.get("package", "SAP_STANDARD"),
                     }
                 else:
-                    selected_views_full_metadata[v] = {
-                        "cds_name": v,
-                        "description": f"Verified SAP View {v}",
+                    selected_views_full_metadata[v_clean] = {
+                        "cds_name": v_clean,
+                        "description": f"Verified SAP View {v_clean}",
                         "fields": [],
                         "keys": [],
                         "associations": [],
                         "joins": [],
                     }
-                    full_metadata_counts[v] = {"fields_count": 0, "keys_count": 0, "associations_count": 0}
+                    full_metadata_counts[v_clean] = {"fields_count": 0, "keys_count": 0, "associations_count": 0}
+
+                # Retrieve COMPLETE original source DDL (Mandatory for Part 7)
+                src = await discovery_svc.get_live_source(v_clean)
+                if not src:
+                    with discovery_svc._get_db() as conn:
+                        c = conn.cursor()
+                        c.execute("SELECT source_code FROM cds_views WHERE UPPER(cds_name) = ?", (v_clean,))
+                        row = c.fetchone()
+                        if row and row["source_code"]:
+                            src = row["source_code"]
+                selected_views_ddl[v_clean] = src or f"// DDL source unavailable for {v_clean}"
             except Exception as e:
-                logger.warning(f"Failed to fetch metadata details for {v}: {e}")
-                selected_views_full_metadata[v] = {"cds_name": v, "fields": [], "associations": [], "joins": []}
-                full_metadata_counts[v] = {"fields_count": 0, "keys_count": 0, "associations_count": 0}
+                logger.warning(f"Failed to fetch metadata/DDL details for {v_clean}: {e}")
+                selected_views_full_metadata[v_clean] = {"cds_name": v_clean, "fields": [], "associations": [], "joins": []}
+                selected_views_ddl[v_clean] = f"// Error fetching DDL for {v_clean}: {e}"
+                full_metadata_counts[v_clean] = {"fields_count": 0, "keys_count": 0, "associations_count": 0}
 
         primary_view = selected_views[0] if selected_views else "I_BaseView"
         primary_alias = f"_{primary_view.replace('I_', '').replace('C_', '').replace('_', '')}"
 
-        # Standard CDS Code Template
+        # Standard CDS Code Template with required extraction annotation
         standard_template = f"""@AccessControl.authorizationCheck: #NOT_REQUIRED
 @EndUserText.label: '{artifact_name}'
+@Analytics.dataExtraction.enabled: true
+@Metadata.ignorePropagatedAnnotations: true
 define view entity {artifact_name}
   as select from {primary_view} as {primary_alias}
   /* Include associations ONLY for secondary views with an explicit verified relationship in Verified Join Relationships */
@@ -1117,16 +1146,19 @@ define view entity {artifact_name}
   {primary_alias}.<TECHNICAL_FIELD> as <BUSINESS_FIELD_ALIAS>
 }}"""
 
-        # Structured Generation Context
+        # Structured Generation Context providing complete source DDL and verified metadata
         generation_context = {
             "business_requirement": requirement,
             "selected_views": selected_views,
             "selected_views_full_metadata": selected_views_full_metadata,
+            "selected_views_original_ddl": selected_views_ddl,
             "authoritative_mappings": mappings,
             "verified_join_paths": join_paths,
             "kpi": kpi,
             "artifact_name": artifact_name,
             "standard_code_template": standard_template,
+            "target_sap_release": "2023",
+            "extraction_annotation_required": "@Analytics.dataExtraction.enabled: true",
         }
 
         # Immutable Generation Context for Validator
@@ -1365,5 +1397,136 @@ Return JSON strictly:
                 "status": "GENERATION_VALIDATION_FAILED",
                 "code_status": "Generation Validation Failed",
             }
+
+    async def generate_wrapper_with_correction_loop(
+        self,
+        requirement: str,
+        selected_views: List[str],
+        mappings: List[Dict[str, Any]],
+        join_paths: Optional[List[Dict[str, Any]]] = None,
+        output_fields: Optional[List[Dict[str, Any]]] = None,
+        artifact_name: str = "ZC_CustomExtractionWrapper",
+        max_attempts: int = 3,
+    ) -> Dict[str, Any]:
+        """Generates extraction wrapper with automated validation correction loop (max 3 attempts).
+
+        Rules (Part 7, Part 8, Part 9):
+        1. Enforces complete original source DDL for every selected view.
+        2. Includes @Analytics.dataExtraction.enabled: true.
+        3. Runs in-memory validation (Stage A static + Stage B SAP source-only investigation).
+        4. When errors occur, passes exact line-numbered errors back to LLM to correct only reported issues.
+        5. Strictly stops after a maximum of THREE attempts if errors persist.
+        """
+        max_attempts = min(max(1, max_attempts), 3)  # Strictly enforce max 3
+        correction_history: List[Dict[str, Any]] = []
+
+        # Attempt 1: Initial Generation
+        gen_response = await self.generate_cds_code(
+            requirement=requirement,
+            selected_views=selected_views,
+            mappings=mappings,
+            join_paths=join_paths,
+            artifact_name=artifact_name,
+        )
+
+        current_code = gen_response.get("result", {}).get("code", "")
+        verified_context = {
+            "artifact_name": artifact_name,
+            "selected_views": selected_views,
+            "mappings": mappings,
+            "join_paths": join_paths,
+        }
+
+        val_res = CDSGenerationValidator.investigate_and_validate_in_memory(current_code, verified_context)
+        correction_history.append({
+            "attempt": 1,
+            "action": "INITIAL_GENERATION",
+            "valid": val_res["valid"],
+            "errors": val_res["errors"],
+            "warnings": val_res["warnings"],
+            "code_hash": val_res.get("ddl_in_memory_hash"),
+        })
+
+        if val_res["valid"]:
+            return {
+                "success": True,
+                "valid": True,
+                "status": "STATIC_VALIDATION_PASSED",
+                "code_status": "Validated In-Memory",
+                "code": current_code,
+                "artifact_name": artifact_name,
+                "attempts": 1,
+                "max_attempts": max_attempts,
+                "correction_history": correction_history,
+                "validation": val_res,
+                "sap_source_validation_status": val_res["sap_source_validation_status"],
+                "sap_investigation": val_res["sap_investigation"],
+            }
+
+        # Attempts 2..3: Correction Loop
+        current_attempt = 1
+        while current_attempt < max_attempts and not val_res["valid"]:
+            current_attempt += 1
+            feedback = (
+                f"Correction Attempt {current_attempt}/{max_attempts}. "
+                f"Please fix the following exact line-numbered validation errors: {json.dumps(val_res['errors'])}. "
+                f"Strictly preserve all selected source CDS views {selected_views}, approved join paths, "
+                f"and verified technical field names. Do not invent unverified names or relations."
+            )
+
+            regen_res = await self.regenerate_code(
+                current_code=current_code,
+                feedback=feedback,
+                verified_context=verified_context,
+                validation_errors=val_res["errors"],
+            )
+
+            if regen_res.get("result", {}).get("code"):
+                current_code = regen_res["result"]["code"]
+
+            val_res = CDSGenerationValidator.investigate_and_validate_in_memory(current_code, verified_context)
+            correction_history.append({
+                "attempt": current_attempt,
+                "action": f"CORRECTION_ATTEMPT_{current_attempt}",
+                "valid": val_res["valid"],
+                "errors": val_res["errors"],
+                "warnings": val_res["warnings"],
+                "code_hash": val_res.get("ddl_in_memory_hash"),
+            })
+
+            if val_res["valid"]:
+                return {
+                    "success": True,
+                    "valid": True,
+                    "status": "STATIC_VALIDATION_PASSED",
+                    "code_status": "Validated In-Memory (After Correction)",
+                    "code": current_code,
+                    "artifact_name": artifact_name,
+                    "attempts": current_attempt,
+                    "max_attempts": max_attempts,
+                    "correction_history": correction_history,
+                    "validation": val_res,
+                    "sap_source_validation_status": val_res["sap_source_validation_status"],
+                    "sap_investigation": val_res["sap_investigation"],
+                }
+
+        # If max attempts reached and still invalid: halt and report remaining errors
+        return {
+            "success": False,
+            "valid": False,
+            "status": "FAILED_VALIDATION",
+            "code_status": "Validation Failed After Max Attempts",
+            "code": current_code,
+            "artifact_name": artifact_name,
+            "attempts": current_attempt,
+            "max_attempts": max_attempts,
+            "correction_history": correction_history,
+            "validation": val_res,
+            "errors": val_res["errors"],
+            "sap_source_validation_status": val_res["sap_source_validation_status"],
+            "sap_investigation": val_res["sap_investigation"],
+            "halt_reason": f"Maximum correction attempts ({max_attempts}) reached. Stopping correction loop.",
+        }
+
 
 

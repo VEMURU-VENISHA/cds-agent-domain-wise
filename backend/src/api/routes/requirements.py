@@ -146,3 +146,50 @@ async def validate_artifact_name_endpoint(payload: ValidateArtifactNamePayload):
         "exists": exists,
     }
 
+
+class GenerateWrapperPayload(BaseModel):
+    requirement: str
+    selected_views: List[str]
+    mappings: List[dict]
+    join_paths: List[dict] = []
+    output_fields: Optional[List[dict]] = None
+    kpi: Optional[dict] = None
+    artifact_name: str = "ZC_ExtractionWrapper"
+    join_configuration_approved: bool = False
+    selected_views_original_ddl: Optional[Dict[str, str]] = None
+
+
+@router.post("/generate-wrapper", summary="Generate custom extraction-enabled wrapper with human-in-the-loop join gate and validation loop")
+async def generate_wrapper_endpoint(payload: GenerateWrapperPayload):
+    """Enforces join approval gate before LLM code generation and executes in-memory correction loop."""
+    if len(payload.selected_views) > 1 and not payload.join_configuration_approved:
+        raise HTTPException(
+            status_code=400,
+            detail="Source CDS and join configuration must be explicitly approved ('APPROVE SOURCE CDS AND JOIN CONFIGURATION') before generating wrapper code.",
+        )
+    res = await gemini_svc.generate_wrapper_with_correction_loop(
+        requirement=payload.requirement,
+        selected_views=payload.selected_views,
+        mappings=payload.mappings,
+        join_paths=payload.join_paths,
+        output_fields=payload.output_fields,
+        kpi=payload.kpi,
+        artifact_name=payload.artifact_name,
+        selected_views_original_ddl=payload.selected_views_original_ddl,
+    )
+    return res
+
+
+class ValidateMemoryPayload(BaseModel):
+    code: str
+    verified_context: Dict[str, Any]
+
+
+@router.post("/validate-memory", summary="Deterministic in-memory validation and SAP source-only capability investigation")
+async def validate_memory_endpoint(payload: ValidateMemoryPayload):
+    """Executes deterministic static validation with line numbers without modifying SAP repository."""
+    return CDSGenerationValidator.investigate_and_validate_in_memory(
+        code=payload.code,
+        verified_context=payload.verified_context,
+    )
+

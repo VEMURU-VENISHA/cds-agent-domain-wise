@@ -72,6 +72,31 @@ interface Props {
   health?: HealthStatus | null;
 }
 
+export interface JoinConfigItem {
+  id: string;
+  left_view: string;
+  left_field: string;
+  right_view: string;
+  right_field: string;
+  join_type: string;
+  cardinality?: string;
+  is_sap_verified: boolean;
+  notes?: string;
+}
+
+export interface OutputFieldItem {
+  id: string;
+  selected: boolean;
+  business_field: string;
+  actual_field: string;
+  field_label: string;
+  source_cds: string;
+  data_type: string;
+  length?: string | number;
+  is_key: boolean;
+  evidence?: string;
+}
+
 const STEP_LABELS = [
   '1. Requirement',
   '2. Required Fields',
@@ -87,6 +112,17 @@ const STEP_LABELS = [
   '12. ADT Creation',
   '13. Completion'
 ];
+
+const WORKFLOW_STEPS = [
+  { id: 1, label: '1. Requirement', sublabel: 'Inputs & Domain' },
+  { id: 2, label: '2. Recommendation', sublabel: 'BASIC Sources & Joins' },
+  { id: 3, label: '3. Mapping', sublabel: 'Field Projection' },
+  { id: 4, label: '4. CDS Generation', sublabel: 'DDL Synthesis' },
+  { id: 5, label: '5. Validation', sublabel: 'Quality & Check-Run' },
+  { id: 6, label: '6. Review & Approval', sublabel: 'Human Sign-Off' },
+  { id: 7, label: '7. SAP Creation & Activation', sublabel: 'Live ADT' },
+];
+
 
 const AVAILABLE_DOMAINS = [
   'Sales',
@@ -231,10 +267,13 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
   const [isSyncing, setIsSyncing] = useState<boolean>(false);
   const [syncStatusMsg, setSyncStatusMsg] = useState<string | null>(null);
 
-  // Step 5: CDS Selection (HITL Gate 2 - Section 26 - Independent selection state)
+  // Step 5: CDS Selection & HITL Configuration (Independent selection, Joins & Field Selection)
   const [selectedCandidateIds, setSelectedCandidateIds] = useState<string[]>([]);
   const [selectedViews, setSelectedViews] = useState<string[]>([]);
   const [selectionSearchQuery, setSelectionSearchQuery] = useState('');
+  const [userJoinConfigurations, setUserJoinConfigurations] = useState<JoinConfigItem[]>([]);
+  const [selectedOutputFields, setSelectedOutputFields] = useState<OutputFieldItem[]>([]);
+  const [confirmedExistingCds, setConfirmedExistingCds] = useState<string | null>(null);
 
   // Step 6: Mapping (Section 27)
   const [fieldMappings, setFieldMappings] = useState<any[]>([]);
@@ -646,75 +685,119 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
     return requiredFields.filter((f) => checkedFields[f.name] !== false);
   }, [requiredFields, checkedFields]);
 
-  // Computed Authoritative Solution Decision according to strict rules:
-  // Priority 1: Single CDS with 100% coverage -> REUSE_EXISTING
-  // Priority 2: Multi-CDS combination -> MULTI_CDS_CREATE
-  // Priority 3: No valid single or multi CDS -> NO_SOLUTION
+  // Computed Authoritative Solution Decision according to strict Extraction-First rules:
+  // OUTCOME A: Existing Extraction-Enabled BASIC CDS Available -> EXISTING_EXTRACTION_ENABLED_CDS
+  // OUTCOME B: Custom Wrapper Required -> CUSTOM_WRAPPER_REQUIRED
+  // OUTCOME C: No Solution Discovered -> NO_SOLUTION
   const computedSolutionDecision = useMemo(() => {
     if (solutionDecision && solutionDecision.solution_type) {
-      if (solutionDecision.solution_type === 'REUSE_EXISTING') {
+      if (solutionDecision.solution_type === 'EXISTING_EXTRACTION_ENABLED_CDS' || solutionDecision.solution_type === 'REUSE_EXISTING') {
         const cand = allCandidates.find(c => c.cds_name === solutionDecision.cds) || allCandidates[0];
-        return { ...solutionDecision, candidate: cand };
+        return {
+          ...solutionDecision,
+          solution_type: 'EXISTING_EXTRACTION_ENABLED_CDS',
+          headline: 'EXISTING EXTRACTION-ENABLED CDS AVAILABLE',
+          custom_wrapper_required: false,
+          candidate: cand,
+        };
       }
-      if (solutionDecision.solution_type === 'MULTI_CDS_CREATE') {
-        const cand = allCandidates.find(c => c.type === 'Multi CDS' || c.cds_name.includes(' + ')) || allCandidates[0];
-        return { ...solutionDecision, candidate: cand };
+      if (solutionDecision.solution_type === 'CUSTOM_WRAPPER_REQUIRED' || solutionDecision.solution_type === 'SINGLE_CDS_WRAPPER_REQUIRED' || solutionDecision.solution_type === 'MULTI_CDS_CREATE') {
+        const cand = allCandidates.find(c =>
+          Array.isArray(solutionDecision.cds)
+            ? solutionDecision.cds.includes(c.cds_name)
+            : c.cds_name === solutionDecision.cds
+        ) || allCandidates[0];
+        return {
+          ...solutionDecision,
+          solution_type: 'CUSTOM_WRAPPER_REQUIRED',
+          headline: 'CUSTOM WRAPPER REQUIRED',
+          custom_wrapper_required: true,
+          candidate: cand,
+        };
       }
       return solutionDecision;
     }
     if (!allCandidates || allCandidates.length === 0) {
       return {
         solution_type: 'NO_SOLUTION',
-        message: 'No CDS candidates discovered in SAP ADT catalog.',
+        headline: 'NO CDS CANDIDATES DISCOVERED',
+        custom_wrapper_required: false,
+        message: 'No verified CDS candidates discovered in SAP ADT catalog.',
         requires_create: false,
       };
     }
-    const single100 = allCandidates.find(
+
+    // Outcome A Check: 100% field coverage + extraction verified enabled in SAP
+    const existingExt100 = allCandidates.find(
+      (c) => (c.type === 'Single CDS' || !c.cds_name.includes(' + ')) &&
+        c.coverage_pct >= 100 &&
+        (c.extraction_status === 'VERIFIED_ENABLED' || c.data_extraction_enabled === true)
+    );
+    if (existingExt100) {
+      return {
+        solution_type: 'EXISTING_EXTRACTION_ENABLED_CDS',
+        headline: 'EXISTING EXTRACTION-ENABLED CDS AVAILABLE',
+        custom_wrapper_required: false,
+        cds: existingExt100.cds_name,
+        candidate: existingExt100,
+        coverage: 100,
+        message: `Existing SAP CDS view '${existingExt100.cds_name}' satisfies 100% of required fields with data extraction enabled. Direct reuse approved without custom wrapper creation.`,
+        requires_create: false,
+      };
+    }
+
+    // Outcome B: Single CDS covers 100% but extraction is disabled in standard SAP
+    const single100NonExt = allCandidates.find(
       (c) => (c.type === 'Single CDS' || !c.cds_name.includes(' + ')) && c.coverage_pct >= 100
     );
-    if (single100) {
+    if (single100NonExt) {
       return {
-        solution_type: 'REUSE_EXISTING',
-        cds: single100.cds_name,
-        candidate: single100,
+        solution_type: 'CUSTOM_WRAPPER_REQUIRED',
+        sub_solution_type: 'SINGLE_CDS_WRAPPER_REQUIRED',
+        headline: 'CUSTOM WRAPPER REQUIRED',
+        custom_wrapper_required: true,
+        cds: single100NonExt.cds_name,
+        candidate: single100NonExt,
         coverage: 100,
-        message: `Single CDS '${single100.cds_name}' satisfies 100% of required fields. Direct reuse approved (no custom CDS creation required).`,
-        requires_create: false,
+        message: `Single BASIC CDS view '${single100NonExt.cds_name}' covers 100% of required fields, but data extraction is not enabled in standard SAP. A custom extraction-enabled wrapper view is required.`,
+        insufficient_extraction_explanation: `Standard SAP CDS view '${single100NonExt.cds_name}' is not enabled for data extraction in standard SAP (view is not listed in authoritative I_DataExtractionEnabledView catalog). A custom extraction-enabled wrapper view entity is required.`,
+        eligible_basic_source_views: [single100NonExt.cds_name],
+        missing_fields: [],
+        requires_create: true,
       };
     }
+
+    // Outcome B: Multi-CDS combination
     const multiCand = allCandidates.find(
       (c) => (c.type === 'Multi CDS' || c.cds_name.includes(' + ')) && c.coverage_pct > 0
     );
     if (multiCand) {
+      const viewsList = multiCand.views || multiCand.cds_name.split(' + ');
       return {
-        solution_type: 'MULTI_CDS_CREATE',
-        cds: multiCand.views || multiCand.cds_name.split(' + '),
+        solution_type: 'CUSTOM_WRAPPER_REQUIRED',
+        sub_solution_type: 'MULTI_CDS_CREATE',
+        headline: 'CUSTOM WRAPPER REQUIRED',
+        custom_wrapper_required: true,
+        cds: viewsList,
         candidate: multiCand,
         coverage: multiCand.coverage_pct,
         join_path: multiCand.join_path || [],
-        message: 'No single CDS contains all required fields. Multi-CDS view composition with verified join path required.',
+        message: 'No single extraction-enabled CDS view contains all required fields. Multi-CDS view composition with verified join path required.',
+        insufficient_extraction_explanation: 'No single extraction-enabled CDS view satisfies all required business fields. A custom extraction wrapper combining verified BASIC views is required.',
+        eligible_basic_source_views: viewsList,
+        missing_fields: multiCand.missing_fields || [],
         requires_create: true,
       };
     }
+
     return {
       solution_type: 'NO_SOLUTION',
+      headline: 'NO VALID CDS SOLUTION',
+      custom_wrapper_required: false,
       message: 'No single CDS gives full coverage and no valid multi-CDS relationship can provide missing fields.',
       requires_create: false,
     };
   }, [solutionDecision, allCandidates]);
-
-  // Handler for REUSE EXISTING CDS (Case 1)
-  const handleUseSingleCdsReuse = (cand: any) => {
-    const cdsName = cand.cds_name;
-    const candId = getCandidateId(cand);
-    setIsReuseFlow(true);
-    setReusedCdsName(cdsName);
-    setReusedCdsItem(cand);
-    setSelectedCandidateIds([candId]);
-    setSelectedViews([cdsName]);
-    setGeneralError(null);
-    setActiveStep(12); // Move to Completion / Reuse Approved step
-  };
 
   // Step 2 -> Step 3 & 4: Start Discovery (Sections 7-10)
   const handleStartDiscovery = async (overrideExtractionOnly?: boolean | React.MouseEvent) => {
@@ -737,17 +820,13 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
     setTimeout(() => setDiscoveryProgressStep(4), 750);
     setTimeout(() => setDiscoveryProgressStep(5), 1000);
 
-    const isExtractionOnly = typeof overrideExtractionOnly === 'boolean' ? overrideExtractionOnly : extractionEnabledOnly;
-
     try {
       const res = await runDiscovery(
         requirementText,
         authoritativeFields,
         searchMode,
         true,
-        selectedDomains,
-        isExtractionOnly,
-        requireDeltaSupport
+        selectedDomains
       );
       if (searchCancelled) return;
 
@@ -859,36 +938,14 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
     return `single:${cand.cds_name.trim()}`;
   };
 
-  // Step 5: Toggle CDS Selection with single-selection enforcement for 100% CDS / REUSE_EXISTING (TEST 4)
-  const toggleCandidateSelection = (cand: any) => {
-    const candId = getCandidateId(cand);
-    if (cand.coverage_pct >= 100 || cand.type === 'Single CDS' || computedSolutionDecision?.solution_type === 'REUSE_EXISTING') {
-      setSelectedCandidateIds([candId]);
-      if (cand.cds_name) {
-        setSelectedViews([cand.cds_name]);
-      }
-    } else {
-      setSelectedCandidateIds((prev) =>
-        prev.includes(candId) ? prev.filter((id) => id !== candId) : [...prev, candId]
-      );
-    }
-  };
-
-  // Step 5 -> Step 6: Proceed to Mapping (Section 27)
-  const handleProceedToMapping = () => {
-    if (!selectedCandidateIds.length) {
-      setGeneralError('Select at least one CDS recommendation to proceed.');
-      return;
-    }
-
+  // Synchronize constituent views, human-controlled join configs, and output fields whenever selection changes
+  const syncSelectionState = (candidateIds: string[]) => {
     const chosenCandidates = allCandidates.filter((c) =>
-      selectedCandidateIds.includes(getCandidateId(c))
+      candidateIds.includes(getCandidateId(c))
     );
 
-    // Extract unique constituent views from all chosen candidates (case-insensitive deduplication using canonical ADT upper-case names)
     const seenUpper = new Set<string>();
     const constituentViews: string[] = [];
-    
     const addViewCanonical = (viewName?: string) => {
       if (!viewName) return;
       const clean = viewName.trim();
@@ -908,9 +965,7 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
             addViewCanonical(jp.right_view);
           });
         } else {
-          c.cds_name.split(' + ').forEach((v: string) => {
-            addViewCanonical(v);
-          });
+          c.cds_name.split(' + ').forEach((v: string) => addViewCanonical(v));
         }
       } else {
         addViewCanonical(c.cds_name);
@@ -919,43 +974,298 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
 
     setSelectedViews(constituentViews);
 
-    // Build field mappings strictly from selected candidates
-    const mappings: any[] = [];
-    authoritativeFields.forEach((rf) => {
-      let mapped = false;
-      for (const cand of chosenCandidates) {
-        const match = (cand.matched_fields || []).find((m: any) => m.business_field === rf.name);
-        if (match) {
-          let targetCds = (match.cds_view || cand.cds_name.split(' + ')[0]).toUpperCase();
-          if (!constituentViews.includes(targetCds)) {
-            targetCds = (constituentViews[0] || cand.cds_name.split(' + ')[0]).toUpperCase();
+    // Sync Join Configurations
+    const initialJoins: JoinConfigItem[] = [];
+    chosenCandidates.forEach((c) => {
+      if (c.join_path && Array.isArray(c.join_path)) {
+        c.join_path.forEach((jp: any, idx: number) => {
+          const leftV = (jp.left_view || '').toUpperCase();
+          const rightV = (jp.right_view || '').toUpperCase();
+          if (leftV && rightV && !initialJoins.some(j => j.left_view === leftV && j.right_view === rightV)) {
+            initialJoins.push({
+              id: `join-${idx}-${leftV}-${rightV}`,
+              left_view: leftV,
+              left_field: jp.left_field || 'SalesOrder',
+              right_view: rightV,
+              right_field: jp.right_field || 'SalesOrder',
+              join_type: jp.join_type || 'INNER JOIN',
+              cardinality: jp.cardinality || '1:1',
+              is_sap_verified: true,
+              notes: 'Verified in SAP ADT relationship catalog',
+            });
           }
-          mappings.push({
-            business_field: rf.name,
-            cds_view: targetCds,
-            actual_field: match.actual_field || rf.name,
-            field_label: match.field_label || rf.name,
-            data_type: match.data_type || 'CHAR(30)',
-            evidence: match.evidence || 'Candidate field match',
-          });
-          mapped = true;
+        });
+      }
+    });
+    if (constituentViews.length > 1 && initialJoins.length === 0) {
+      initialJoins.push({
+        id: `join-default-${constituentViews[0]}-${constituentViews[1]}`,
+        left_view: constituentViews[0],
+        left_field: 'SalesOrder',
+        right_view: constituentViews[1],
+        right_field: 'SalesOrder',
+        join_type: 'INNER JOIN',
+        cardinality: '1:1',
+        is_sap_verified: false,
+        notes: 'User proposed relationship',
+      });
+    }
+    setUserJoinConfigurations(initialJoins);
+
+    // Sync Output Fields
+    const outputFields: OutputFieldItem[] = [];
+    const seenFieldKeys = new Set<string>();
+
+    authoritativeFields.forEach((rf, idx) => {
+      let matchedCandField: any = null;
+      let sourceView = constituentViews[0] || '';
+      for (const cand of chosenCandidates) {
+        const m = (cand.matched_fields || []).find((f: any) => f.business_field === rf.name);
+        if (m) {
+          matchedCandField = m;
+          sourceView = (m.cds_view || cand.cds_name.split(' + ')[0]).toUpperCase();
           break;
         }
       }
-      if (!mapped) {
-        mappings.push({
-          business_field: rf.name,
-          cds_view: (constituentViews[0] || 'I_SalesOrder').toUpperCase(),
-          actual_field: rf.name,
-          field_label: rf.name,
-          data_type: 'CHAR(30)',
-          evidence: 'User mapped override',
+      const fieldKey = `${sourceView}.${rf.name}`.toUpperCase();
+      seenFieldKeys.add(fieldKey);
+      outputFields.push({
+        id: `field-req-${idx}`,
+        selected: true,
+        business_field: rf.name,
+        actual_field: matchedCandField?.actual_field || rf.name,
+        field_label: matchedCandField?.field_label || rf.name,
+        source_cds: sourceView || constituentViews[0] || 'I_SalesOrder',
+        data_type: matchedCandField?.data_type || 'CHAR',
+        length: matchedCandField?.length || 30,
+        is_key: idx === 0 || matchedCandField?.is_key === 1 || matchedCandField?.is_key === true,
+        evidence: matchedCandField?.evidence || 'Required business field',
+      });
+    });
+
+    chosenCandidates.forEach((cand) => {
+      const candFields = cand.fields || [];
+      candFields.slice(0, 15).forEach((cf: any, cidx: number) => {
+        const vName = (cf.cds_name || cand.cds_name.split(' + ')[0]).toUpperCase();
+        const fName = cf.fieldname || cf.name;
+        const fieldKey = `${vName}.${fName}`.toUpperCase();
+        if (!seenFieldKeys.has(fieldKey)) {
+          seenFieldKeys.add(fieldKey);
+          outputFields.push({
+            id: `field-aux-${vName}-${cidx}`,
+            selected: false,
+            business_field: fName,
+            actual_field: fName,
+            field_label: cf.field_label || cf.description || fName,
+            source_cds: vName,
+            data_type: cf.data_type || 'CHAR',
+            length: cf.length || 30,
+            is_key: Boolean(cf.is_key),
+            evidence: 'Available candidate field',
+          });
+        }
+      });
+    });
+    setSelectedOutputFields(outputFields);
+  };
+
+  // Step 4 & 5: Toggle CDS Selection with real-time field and join synchronization
+  const toggleCandidateSelection = (cand: any) => {
+    const candId = getCandidateId(cand);
+    let newSelectedIds: string[];
+    if (selectedCandidateIds.includes(candId)) {
+      newSelectedIds = selectedCandidateIds.filter((id) => id !== candId);
+    } else {
+      newSelectedIds = [...selectedCandidateIds, candId];
+    }
+    setSelectedCandidateIds(newSelectedIds);
+    syncSelectionState(newSelectedIds);
+  };
+
+  // Confirm selection and navigate directly to Mapping (no separate Selection page!)
+  const handleConfirmSelectionAndJoin = () => {
+    if (!selectedCandidateIds.length) {
+      setGeneralError('Select at least one CDS recommendation to proceed.');
+      return;
+    }
+
+    const activeFields = selectedOutputFields.filter((f) => f.selected);
+    const fieldsToMap = activeFields.length > 0 ? activeFields : selectedOutputFields;
+    const mappings = fieldsToMap.map((f) => ({
+      business_field: f.business_field,
+      cds_view: f.source_cds || (selectedViews[0] || 'I_SalesOrder').toUpperCase(),
+      actual_field: f.actual_field || f.business_field,
+      field_label: f.field_label || f.business_field,
+      data_type: f.data_type || 'CHAR(30)',
+      length: f.length || 30,
+      is_key: f.is_key,
+      evidence: f.evidence || 'User approved mapping',
+    }));
+
+    setFieldMappings(mappings);
+    setActiveStep(5); // Step 6: Mapping (direct navigation from Recommendation!)
+  };
+
+  // Outcome A: Direct confirmation for existing extraction-enabled CDS view
+  const handleConfirmExistingCdsSelection = (cand: any) => {
+    const cdsName = cand.cds_name;
+    setIsReuseFlow(true);
+    setReusedCdsName(cdsName);
+    setReusedCdsItem(cand);
+    setSelectedViews([cdsName.toUpperCase()]);
+    setSelectedCandidateIds([getCandidateId(cand)]);
+    const mappings = authoritativeFields.map((rf) => {
+      const match = (cand.matched_fields || []).find((m: any) => m.business_field === rf.name);
+      return {
+        business_field: rf.name,
+        cds_view: cdsName.toUpperCase(),
+        actual_field: match?.actual_field || rf.name,
+        field_label: match?.field_label || rf.name,
+        data_type: match?.data_type || 'CHAR(30)',
+        evidence: match?.evidence || 'Existing extraction-enabled CDS view match',
+      };
+    });
+    setFieldMappings(mappings);
+    setActiveStep(5); // Direct navigation to Mapping!
+  };
+
+  // Handler for REUSE EXISTING CDS (Outcome A)
+  const handleUseSingleCdsReuse = (cand: any) => {
+    handleConfirmExistingCdsSelection(cand);
+  };
+
+  // Step 5 -> Step 6: Legacy proceed helper
+  const handleProceedToMapping = () => {
+    handleConfirmSelectionAndJoin();
+  };
+
+  // Human-controlled Join Configuration Helpers (Recommendation Page HITL)
+  const handleAddJoinRow = () => {
+    if (selectedViews.length < 2) return;
+    const leftV = selectedViews[0];
+    const rightV = selectedViews[1];
+    const newJoin: JoinConfigItem = {
+      id: `join-${Date.now()}`,
+      left_view: leftV,
+      left_field: 'SalesOrder',
+      right_view: rightV,
+      right_field: 'SalesOrder',
+      join_type: 'INNER JOIN',
+      cardinality: '1:1',
+      is_sap_verified: false,
+      notes: 'User-specified relationship',
+    };
+    setUserJoinConfigurations((prev) => [...prev, newJoin]);
+  };
+
+  const handleUpdateJoinRow = (id: string, updates: Partial<JoinConfigItem>) => {
+    setUserJoinConfigurations((prev) =>
+      prev.map((j) => (j.id === id ? { ...j, ...updates } : j))
+    );
+  };
+
+  const handleDeleteJoinRow = (id: string) => {
+    setUserJoinConfigurations((prev) => prev.filter((j) => j.id !== id));
+  };
+
+  // Helper to retrieve all available fields for a specific CDS view entity for Join dropdowns
+  const getViewFields = (viewName?: string): string[] => {
+    if (!viewName) return [];
+    const fieldsSet = new Set<string>();
+    const vUpper = viewName.trim().toUpperCase();
+
+    // 1. Check allCandidates
+    allCandidates.forEach((cand) => {
+      const cViews = (cand.views || cand.cds_name.split(' + ')).map((v: string) => v.trim().toUpperCase());
+      if (cViews.includes(vUpper) || cand.cds_name.trim().toUpperCase() === vUpper) {
+        (cand.fields || []).forEach((cf: any) => {
+          const fn = cf.fieldname || cf.name;
+          if (fn && typeof fn === 'string') fieldsSet.add(fn.trim());
+        });
+        (cand.matched_fields || []).forEach((mf: any) => {
+          const fn = mf.actual_field;
+          if (fn && typeof fn === 'string') fieldsSet.add(fn.trim());
         });
       }
     });
 
-    setFieldMappings(mappings);
-    setActiveStep(5); // Step 6: Mapping
+    // 2. Check selectedOutputFields
+    selectedOutputFields.forEach((f) => {
+      if ((f.source_cds || '').trim().toUpperCase() === vUpper) {
+        if (f.actual_field) fieldsSet.add(f.actual_field.trim());
+        if (f.business_field) fieldsSet.add(f.business_field.trim());
+      }
+    });
+
+    // 3. Fallback common SAP join keys if catalog is sparse
+    const commonKeys = [
+      'SalesOrder',
+      'SalesOrderItem',
+      'Customer',
+      'SoldToParty',
+      'CompanyCode',
+      'Material',
+      'Product',
+      'BillingDocument',
+      'BillingDocumentItem',
+      'Plant',
+      'PurchasingDocument',
+      'Supplier',
+      'CreationDate',
+      'LastChangeDateTime'
+    ];
+    commonKeys.forEach((k) => fieldsSet.add(k));
+
+    return Array.from(fieldsSet);
+  };
+
+  const handleRemoveSelectedView = (viewName: string) => {
+    const vUpper = viewName.toUpperCase();
+    const remainingViews = selectedViews.filter((v) => v !== vUpper);
+    setSelectedViews(remainingViews);
+    setUserJoinConfigurations((prev) =>
+      prev.filter((j) => j.left_view !== vUpper && j.right_view !== vUpper)
+    );
+    setSelectedOutputFields((prev) => prev.filter((f) => f.source_cds !== vUpper));
+    const remainingCandIds = selectedCandidateIds.filter((cid) => {
+      const cand = allCandidates.find((c) => getCandidateId(c) === cid);
+      if (!cand) return true;
+      const cViews = cand.views || cand.cds_name.split(' + ').map((v: string) => v.trim().toUpperCase());
+      return !cViews.every((v: string) => v === vUpper);
+    });
+    setSelectedCandidateIds(remainingCandIds);
+  };
+
+  // Recommendation Page Field Selection Helpers
+  const handleToggleFieldSelection = (id: string) => {
+    setSelectedOutputFields((prev) =>
+      prev.map((f) => (f.id === id ? { ...f, selected: !f.selected } : f))
+    );
+  };
+
+  const handleToggleFieldKey = (id: string) => {
+    setSelectedOutputFields((prev) =>
+      prev.map((f) => (f.id === id ? { ...f, is_key: !f.is_key } : f))
+    );
+  };
+
+  const handleSelectAllRequiredFields = () => {
+    setSelectedOutputFields((prev) =>
+      prev.map((f) => {
+        const isReq = authoritativeFields.some(
+          (rf) => rf.name.toLowerCase() === f.business_field.toLowerCase() || rf.name.toLowerCase() === f.actual_field.toLowerCase()
+        );
+        return isReq ? { ...f, selected: true } : f;
+      })
+    );
+  };
+
+  const handleSelectAllAvailableFields = () => {
+    setSelectedOutputFields((prev) => prev.map((f) => ({ ...f, selected: true })));
+  };
+
+  const handleClearFieldSelection = () => {
+    setSelectedOutputFields((prev) => prev.map((f) => ({ ...f, selected: false })));
   };
 
   // Step 8: Trigger Code Generation with Gemini (Section 29)
@@ -988,19 +1298,29 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
         }
       });
 
-      const joinPaths = verifiedJoinPaths.length > 0
-        ? verifiedJoinPaths
-        : (selectedViews.length > 1
-            ? [
-                {
-                  left_view: selectedViews[0],
-                  left_field: 'SalesOrder',
-                  right_view: selectedViews[1],
-                  right_field: 'SalesOrder',
-                  join_type: 'INNER JOIN',
-                },
-              ]
-            : []);
+      const joinPaths = userJoinConfigurations.length > 0
+        ? userJoinConfigurations.map(j => ({
+            left_view: j.left_view,
+            left_field: j.left_field,
+            right_view: j.right_view,
+            right_field: j.right_field,
+            join_type: j.join_type,
+            cardinality: j.cardinality || '1:1',
+            association_name: `_${j.right_view.replace('I_', '')}`,
+          }))
+        : (verifiedJoinPaths.length > 0
+            ? verifiedJoinPaths
+            : (selectedViews.length > 1
+                ? [
+                    {
+                      left_view: selectedViews[0],
+                      left_field: 'SalesOrder',
+                      right_view: selectedViews[1],
+                      right_field: 'SalesOrder',
+                      join_type: 'INNER JOIN',
+                    },
+                  ]
+                : []));
 
       const res = await generateCdsCode({
         requirement: requirementText,
@@ -1262,6 +1582,12 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
                 CDS Enabled
               </span>
+              <span className="text-[10px] bg-blue-100 text-blue-800 font-bold px-2 py-0.5 rounded-md border border-blue-300 flex items-center gap-1 shadow-2xs">
+                BASIC
+              </span>
+              <span className="text-[10px] bg-sky-50 text-sky-700 font-mono px-1.5 py-0.5 rounded border border-sky-200">
+                Non-Parameterized
+              </span>
               {/* Authoritative SAP Data Extraction Badges */}
               {cand.data_extraction_enabled ? (
                 <span
@@ -1421,9 +1747,9 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
               <button
                 onClick={() => handleUseSingleCdsReuse(cand)}
                 className="px-4 py-1.5 rounded-lg text-xs font-bold bg-[#00A878] hover:bg-[#00A878]/90 text-white shadow-xs flex items-center gap-1.5"
-                title="Satisfies 100% of required fields — Reuse existing CDS without creation"
+                title="Satisfies 100% of required fields — Direct reuse of verified extraction-enabled CDS view"
               >
-                <CheckCircle2 className="w-3.5 h-3.5" /> USE THIS CDS
+                <CheckCircle2 className="w-3.5 h-3.5" /> SELECT EXISTING CDS →
               </button>
             ) : (
               <button
@@ -1530,6 +1856,67 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
         )}
       </div>
     );
+  };
+
+  const getStepState = (stepId: number) => {
+    let isCurrent = false;
+    let isCompleted = false;
+    let canNavigate = false;
+    let targetStep = 0;
+
+    switch (stepId) {
+      case 1: // Requirement
+        isCurrent = activeStep >= 0 && activeStep <= 2;
+        isCompleted = activeStep >= 3;
+        canNavigate = true;
+        targetStep = 0;
+        break;
+
+      case 2: // Recommendation
+        isCurrent = activeStep === 3 || activeStep === 4;
+        isCompleted = isReuseFlow ? activeStep === 12 : activeStep >= 5;
+        canNavigate = allCandidates.length > 0 || activeStep >= 3;
+        targetStep = 3;
+        break;
+
+      case 3: // Mapping
+        isCurrent = activeStep === 5 || activeStep === 6;
+        isCompleted = isReuseFlow ? activeStep === 12 : activeStep >= 7;
+        canNavigate = (selectedViews.length > 0 || isReuseFlow) && activeStep >= 5;
+        targetStep = 5;
+        break;
+
+      case 4: // CDS Generation
+        isCurrent = !isReuseFlow && activeStep === 7;
+        isCompleted = !isReuseFlow && activeStep >= 8;
+        canNavigate = !isReuseFlow && fieldMappings.length > 0 && activeStep >= 7;
+        targetStep = 7;
+        break;
+
+      case 5: // Validation
+        isCurrent = !isReuseFlow && activeStep === 8;
+        isCompleted = !isReuseFlow && activeStep >= 9;
+        canNavigate = !isReuseFlow && (!!generatedCode || !!userProvidedCode) && activeStep >= 8;
+        targetStep = 8;
+        break;
+
+      case 6: // Review & Approval
+        isCurrent = !isReuseFlow && (activeStep === 9 || activeStep === 10);
+        isCompleted = !isReuseFlow && activeStep >= 11;
+        canNavigate = !isReuseFlow && activeStep >= 9;
+        targetStep = 10;
+        break;
+
+      case 7: // SAP Creation & Activation
+        // Rule: Never mark complete before SAP confirms success!
+        isCurrent = activeStep === 11 || (activeStep === 12 && creationResult?.success !== true && !isReuseFlow);
+        isCompleted = (activeStep === 12 && creationResult?.success === true) || (isReuseFlow && activeStep === 12);
+        canNavigate = activeStep >= 11;
+        targetStep = isReuseFlow ? 12 : 11;
+        break;
+    }
+
+    return { isCurrent, isCompleted, canNavigate, targetStep };
   };
 
   return (
@@ -1653,49 +2040,76 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
         </div>
       )}
 
-      {/* 2. UI Stepper (13 Steps) */}
-      <div className="bg-white border border-[#D9E4F0] rounded-2xl p-4 shadow-sm overflow-x-auto">
-        <div className="flex items-center gap-2 min-w-max">
-          {STEP_LABELS.map((label, idx) => {
-            const isReuseActive = isReuseFlow;
-            const isCreationStepForReuse = isReuseActive && idx >= 5 && idx <= 11;
-            if (isCreationStepForReuse) {
-              return null;
-            }
-            const isDone = idx < activeStep;
-            const isCurrent = idx === activeStep;
+      {/* 2. Top Workflow Stepper (Restored 7-Step Enterprise Order) */}
+      <div className="bg-white border border-[#D9E4F0] rounded-2xl p-4 shadow-sm">
+        <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2">
+          {WORKFLOW_STEPS.map((step) => {
+            const { isCurrent, isCompleted, canNavigate, targetStep } = getStepState(step.id);
+            const isBypassedForReuse = isReuseFlow && step.id >= 4 && step.id <= 6;
+
             return (
-              <React.Fragment key={label}>
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (idx <= activeStep) setActiveStep(idx);
-                  }}
-                  className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium transition ${
-                    isCurrent
-                      ? 'bg-[#0A6ED1] text-white shadow-xs font-semibold'
-                      : isDone
-                      ? 'bg-[#E8F8F3] text-[#00A878] border border-[#00A878]/30 hover:bg-[#E8F8F3]/80'
-                      : 'bg-[#F4F8FC] text-[#5F7187] border border-[#D9E4F0] hover:text-[#0F2747]'
-                  }`}
-                >
+              <button
+                key={step.id}
+                type="button"
+                disabled={!canNavigate}
+                onClick={() => {
+                  if (canNavigate) setActiveStep(targetStep);
+                }}
+                className={`relative flex flex-col items-start p-3 rounded-xl border text-left transition ${
+                  isCurrent
+                    ? 'bg-[#0A6ED1] border-[#0A6ED1] text-white shadow-sm ring-2 ring-[#0A6ED1]/20'
+                    : isCompleted
+                    ? 'bg-[#E8F8F3] border-[#00A878]/40 text-[#0F2747] hover:border-[#00A878]'
+                    : isBypassedForReuse
+                    ? 'bg-gray-50 border-gray-200 text-gray-400 opacity-60 cursor-not-allowed'
+                    : 'bg-[#F4F8FC] border-[#D9E4F0] text-[#5F7187] hover:border-[#0A6ED1]/40'
+                } ${canNavigate ? 'cursor-pointer' : 'cursor-default'}`}
+              >
+                <div className="flex items-center justify-between w-full mb-1">
                   <span
-                    className={`w-4 h-4 rounded-full flex items-center justify-center text-[10px] font-bold ${
-                      isDone
-                        ? 'bg-[#00A878] text-white'
-                        : isCurrent
+                    className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold ${
+                      isCurrent
                         ? 'bg-white text-[#0A6ED1]'
-                        : 'bg-[#D9E4F0] text-[#5F7187]'
+                        : isCompleted
+                        ? 'bg-[#00A878] text-white'
+                        : isBypassedForReuse
+                        ? 'bg-gray-200 text-gray-500'
+                        : 'bg-white text-[#5F7187] border border-[#D9E4F0]'
                     }`}
                   >
-                    {isDone ? <Check className="w-2.5 h-2.5" /> : idx + 1}
+                    {isCompleted ? <Check className="w-3 h-3 stroke-[2.5]" /> : step.id}
                   </span>
-                  <span>{label.replace(/^\d+\.\s*/, '')}</span>
-                </button>
-                {idx < STEP_LABELS.length - 1 && !(isReuseActive && idx === 4) && (
-                  <ArrowRight className="w-3.5 h-3.5 text-[#D9E4F0]" />
-                )}
-              </React.Fragment>
+                  {isCurrent && (
+                    <span className="text-[9px] font-bold uppercase tracking-wider bg-white/20 text-white px-1.5 py-0.5 rounded">
+                      Active
+                    </span>
+                  )}
+                  {isCompleted && (
+                    <span className="text-[9px] font-bold uppercase tracking-wider text-[#00A878] bg-white px-1.5 py-0.5 rounded border border-[#00A878]/30">
+                      Done
+                    </span>
+                  )}
+                  {isBypassedForReuse && (
+                    <span className="text-[9px] text-gray-500 bg-white px-1 py-0.5 rounded">
+                      Reuse
+                    </span>
+                  )}
+                </div>
+                <div
+                  className={`text-xs font-bold leading-tight truncate w-full ${
+                    isCurrent ? 'text-white' : isCompleted ? 'text-[#0F2747]' : 'text-[#172B4D]'
+                  }`}
+                >
+                  {step.label}
+                </div>
+                <div
+                  className={`text-[10px] truncate w-full mt-0.5 ${
+                    isCurrent ? 'text-white/80' : isCompleted ? 'text-[#00A878]' : 'text-[#5F7187]'
+                  }`}
+                >
+                  {isBypassedForReuse ? 'Standard CDS Reuse' : step.sublabel}
+                </div>
+              </button>
             );
           })}
         </div>
@@ -1792,55 +2206,6 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
                 </div>
               </div>
 
-              {/* Data Extraction Capability Toggle (I_DataExtractionEnabledView) */}
-              <div className="p-4 bg-gradient-to-r from-emerald-50/70 via-[#F4F8FC] to-blue-50/40 border border-[#D9E4F0] rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-xs">
-                <div className="flex items-start sm:items-center gap-3">
-                  <div className="w-8 h-8 rounded-lg bg-emerald-100 text-emerald-700 flex items-center justify-center shrink-0">
-                    <Database className="w-4 h-4" />
-                  </div>
-                  <div>
-                    <div className="flex items-center gap-2">
-                      <span className="text-xs font-bold text-[#0F2747]">SAP Data Extraction Filtering</span>
-                      <span className="text-[10px] font-mono bg-white text-emerald-700 font-semibold px-2 py-0.5 rounded border border-emerald-300">
-                        I_DataExtractionEnabledView
-                      </span>
-                    </div>
-                    <p className="text-[11px] text-[#5F7187] mt-0.5">
-                      When enabled, discovery strictly recommends CDS views verified as data extraction enabled in authoritative SAP metadata.
-                    </p>
-                  </div>
-                </div>
-                <div className="flex items-center gap-2 shrink-0">
-                  <button
-                    type="button"
-                    onClick={() => setExtractionEnabledOnly(!extractionEnabledOnly)}
-                    className={`px-3.5 py-1.5 rounded-lg text-xs font-bold transition flex items-center gap-1.5 shadow-2xs ${
-                      extractionEnabledOnly
-                        ? 'bg-emerald-600 text-white'
-                        : 'bg-white border border-[#D9E4F0] text-[#5F7187] hover:text-[#0F2747]'
-                    }`}
-                  >
-                    <CheckCircle className={`w-3.5 h-3.5 ${extractionEnabledOnly ? 'text-white' : 'text-[#5F7187]'}`} />
-                    {extractionEnabledOnly ? 'Data Extraction: ACTIVE' : 'Data Extraction: OFF'}
-                  </button>
-                  {extractionEnabledOnly && (
-                    <button
-                      type="button"
-                      onClick={() => setRequireDeltaSupport(!requireDeltaSupport)}
-                      className={`px-2.5 py-1.5 rounded-lg text-xs font-semibold transition border flex items-center gap-1 ${
-                        requireDeltaSupport
-                          ? 'bg-purple-600 text-white border-purple-600'
-                          : 'bg-white border-purple-200 text-purple-700 hover:bg-purple-50'
-                      }`}
-                      title="Require Delta Change Data Capture (CDC)"
-                    >
-                      <Zap className="w-3.5 h-3.5" />
-                      Delta CDC
-                    </button>
-                  )}
-                </div>
-              </div>
-
               {/* Requirement Text */}
               <div>
                 <label className="text-xs font-bold text-[#0F2747]">Natural-Language Business Requirement</label>
@@ -1872,55 +2237,6 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
           {/* INTAKE MODE B: SEARCH BY SAP TABLE */}
           {intakeMode === 'SAP_TABLE' && (
             <div className="space-y-6">
-              {/* SAP Data Extraction Filtering Toggle for Table Lineage (Authoritative I_DataExtractionEnabledView) */}
-              <div className="p-3.5 bg-gradient-to-r from-emerald-50/70 via-white to-blue-50/50 border border-emerald-200/80 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-2xs">
-                <div className="flex items-center gap-2.5">
-                  <div className="w-8 h-8 rounded-lg bg-emerald-100 text-emerald-800 flex items-center justify-center shrink-0">
-                    <Database className="w-4 h-4" />
-                  </div>
-                  <div>
-                    <div className="flex items-center gap-2">
-                      <span className="text-xs font-bold text-[#0F2747]">SAP Data Extraction Filtering</span>
-                      <span className="text-[10px] font-mono bg-white text-emerald-700 font-semibold px-2 py-0.5 rounded border border-emerald-300">
-                        I_DataExtractionEnabledView
-                      </span>
-                    </div>
-                    <p className="text-[11px] text-[#5F7187] mt-0.5">
-                      When enabled, table lineage strictly recommends CDS views verified as data extraction enabled in authoritative SAP metadata.
-                    </p>
-                  </div>
-                </div>
-                <div className="flex items-center gap-2 shrink-0">
-                  <button
-                    type="button"
-                    onClick={toggleTableExtraction}
-                    className={`px-3.5 py-1.5 rounded-lg text-xs font-bold transition flex items-center gap-1.5 shadow-2xs ${
-                      tableExtractionOnly
-                        ? 'bg-emerald-600 text-white'
-                        : 'bg-white border border-[#D9E4F0] text-[#5F7187] hover:text-[#0F2747]'
-                    }`}
-                  >
-                    <CheckCircle className={`w-3.5 h-3.5 ${tableExtractionOnly ? 'text-white' : 'text-[#5F7187]'}`} />
-                    {tableExtractionOnly ? 'Data Extraction: ACTIVE' : 'Data Extraction: OFF'}
-                  </button>
-                  {tableExtractionOnly && (
-                    <button
-                      type="button"
-                      onClick={toggleTableDelta}
-                      className={`px-2.5 py-1.5 rounded-lg text-xs font-semibold transition border flex items-center gap-1 ${
-                        tableDeltaOnly
-                          ? 'bg-purple-600 text-white border-purple-600'
-                          : 'bg-white border-purple-200 text-purple-700 hover:bg-purple-50'
-                      }`}
-                      title="Require Delta Change Data Capture (CDC)"
-                    >
-                      <Zap className="w-3.5 h-3.5" />
-                      Delta CDC
-                    </button>
-                  )}
-                </div>
-              </div>
-
               {/* Search Bar & Quick Pills */}
               <div className="space-y-3">
                 <div className="flex gap-2.5 max-w-2xl">
@@ -2048,15 +2364,18 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
                               ⚡ {tableLineageResult.query_time_ms}ms (86,298 views)
                             </span>
                           )}
+                          <span className="inline-flex items-center gap-1 text-[10px] bg-blue-100 text-blue-800 font-bold px-2 py-0.5 rounded-full border border-blue-300">
+                            <ShieldCheck className="w-3 h-3 text-blue-600" /> BASIC Views Only (Part 2)
+                          </span>
                         </div>
                         <p className="text-[11px] text-[#5F7187] mt-0.5">
                           {tableLineageResult.is_multi_table ? (
                             <>
-                              Found <span className="font-bold text-[#00A878]">{tableLineageResult.total_combined_matches}</span> combined CDS view(s) connecting all requested tables, and <span className="font-bold text-[#0F2747]">{tableLineageResult.total_matches}</span> total related views.
+                              Found <span className="font-bold text-[#00A878]">{tableLineageResult.total_combined_matches}</span> verified non-parameterized <span className="font-bold text-blue-700">BASIC</span> CDS view(s) connecting all requested tables, and <span className="font-bold text-[#0F2747]">{tableLineageResult.total_matches}</span> total related views.
                             </>
                           ) : (
                             <>
-                              Discovered <span className="font-bold text-[#0F2747]">{tableLineageResult.total_matches}</span> verified CDS view(s) consuming this table across <span className="font-semibold text-[#00A878]">as select from</span>, <span className="font-semibold text-amber-600">join</span>, or <span className="font-semibold text-cyan-600">association</span> clauses.
+                              Discovered <span className="font-bold text-[#0F2747]">{tableLineageResult.total_matches}</span> verified non-parameterized <span className="font-bold text-blue-700">BASIC</span> CDS view(s) consuming this table across <span className="font-semibold text-[#00A878]">as select from</span>, <span className="font-semibold text-amber-600">join</span>, or <span className="font-semibold text-cyan-600">association</span> clauses.
                             </>
                           )}
                         </p>
@@ -2208,6 +2527,12 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
                                     <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
                                     CDS Enabled
                                   </span>
+                                  <span className="text-[10px] bg-blue-100 text-blue-800 font-bold px-2 py-0.5 rounded-md border border-blue-300 flex items-center gap-1 shadow-2xs">
+                                    BASIC
+                                  </span>
+                                  <span className="text-[10px] bg-sky-50 text-sky-700 font-mono px-1.5 py-0.5 rounded border border-sky-200">
+                                    Non-Parameterized
+                                  </span>
                                   {/* Authoritative Extraction Badges */}
                                   {cv.data_extraction_enabled ? (
                                     <span
@@ -2345,6 +2670,12 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
                                     <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
                                     CDS Enabled
                                   </span>
+                                  <span className="text-[10px] bg-blue-100 text-blue-800 font-bold px-2 py-0.5 rounded-md border border-blue-300 flex items-center gap-1 shadow-2xs">
+                                    BASIC
+                                  </span>
+                                  <span className="text-[10px] bg-sky-50 text-sky-700 font-mono px-1.5 py-0.5 rounded border border-sky-200">
+                                    Non-Parameterized
+                                  </span>
                                   {/* Authoritative Extraction Badges */}
                                   {src.data_extraction_enabled ? (
                                     <span
@@ -2388,7 +2719,7 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
                                     </span>
                                   ) : (
                                     <span className="text-[10px] bg-blue-50 text-blue-700 font-bold px-2 py-0.5 rounded-md border border-blue-200">
-                                      COMPOSITE LINEAGE (Level {src.level})
+                                      BASIC LINEAGE (Level {src.level})
                                     </span>
                                   )}
                                   <span className="text-[10px] bg-gray-100 text-[#5F7187] px-2 py-0.5 rounded-md">
@@ -2483,6 +2814,12 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
                                   <span className="text-[10px] bg-emerald-50 text-emerald-700 font-bold px-2 py-0.5 rounded-md border border-emerald-300 flex items-center gap-1">
                                     <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
                                     CDS Enabled
+                                  </span>
+                                  <span className="text-[10px] bg-blue-100 text-blue-800 font-bold px-2 py-0.5 rounded-md border border-blue-300 flex items-center gap-1 shadow-2xs">
+                                    BASIC
+                                  </span>
+                                  <span className="text-[10px] bg-sky-50 text-sky-700 font-mono px-1.5 py-0.5 rounded border border-sky-200">
+                                    Non-Parameterized
                                   </span>
                                   {/* Authoritative Extraction Badges */}
                                   {j.data_extraction_enabled ? (
@@ -2606,6 +2943,12 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
                                   <span className="text-[10px] bg-emerald-50 text-emerald-700 font-bold px-2 py-0.5 rounded-md border border-emerald-300 flex items-center gap-1">
                                     <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
                                     CDS Enabled
+                                  </span>
+                                  <span className="text-[10px] bg-blue-100 text-blue-800 font-bold px-2 py-0.5 rounded-md border border-blue-300 flex items-center gap-1 shadow-2xs">
+                                    BASIC
+                                  </span>
+                                  <span className="text-[10px] bg-sky-50 text-sky-700 font-mono px-1.5 py-0.5 rounded border border-sky-200">
+                                    Non-Parameterized
                                   </span>
                                   {/* Authoritative Extraction Badges */}
                                   {a.data_extraction_enabled ? (
@@ -2941,68 +3284,14 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
               <ArrowLeft className="w-3.5 h-3.5" /> Back to Requirement
             </button>
             <div className="flex items-center gap-3">
-              <div className="flex items-center gap-2 text-xs text-[#5F7187]">
-                <span>Search Mode:</span>
-                <button
-                  onClick={() => setSearchMode('fast')}
-                  className={`px-2.5 py-1 rounded text-xs font-medium border ${
-                    searchMode === 'fast'
-                      ? 'bg-[#0A6ED1] text-white border-[#0A6ED1]'
-                      : 'bg-white text-[#5F7187] border-[#D9E4F0]'
-                  }`}
-                >
-                  Fast Search
-                </button>
-                <button
-                  onClick={() => setSearchMode('deep')}
-                  className={`px-2.5 py-1 rounded text-xs font-medium border ${
-                    searchMode === 'deep'
-                      ? 'bg-[#0A6ED1] text-white border-[#0A6ED1]'
-                      : 'bg-white text-[#5F7187] border-[#D9E4F0]'
-                  }`}
-                >
-                  Deep Search
-                </button>
-              </div>
-
-              {/* Data Extraction Toggle in Step 2 */}
-              <div className="flex items-center gap-2 border-l border-[#D9E4F0] pl-3">
-                <button
-                  type="button"
-                  onClick={() => setExtractionEnabledOnly(!extractionEnabledOnly)}
-                  className={`px-3 py-1 rounded-lg text-xs font-bold border transition flex items-center gap-1.5 shadow-2xs ${
-                    extractionEnabledOnly
-                      ? 'bg-emerald-600 text-white border-emerald-600'
-                      : 'bg-white text-[#5F7187] border-[#D9E4F0] hover:text-[#0F2747]'
-                  }`}
-                  title="Filter strictly to CDS views verified in SAP authoritative view I_DataExtractionEnabledView"
-                >
-                  <CheckCircle className={`w-3.5 h-3.5 ${extractionEnabledOnly ? 'text-white' : 'text-[#5F7187]'}`} />
-                  Extraction Only {extractionEnabledOnly ? '(ON)' : '(OFF)'}
-                </button>
-
-                {extractionEnabledOnly && (
-                  <button
-                    type="button"
-                    onClick={() => setRequireDeltaSupport(!requireDeltaSupport)}
-                    className={`px-2 py-1 rounded text-xs font-semibold border transition flex items-center gap-1 ${
-                      requireDeltaSupport
-                        ? 'bg-purple-600 text-white border-purple-600 shadow-2xs'
-                        : 'bg-purple-50 text-purple-700 border-purple-200 hover:bg-purple-100'
-                    }`}
-                    title="Require Delta Change Data Capture (CDC)"
-                  >
-                    <Zap className="w-3.5 h-3.5" />
-                    Delta CDC
-                  </button>
-                )}
-              </div>
-
+              <span className="text-xs text-[#5F7187]">
+                {authoritativeFields.length} Authoritative Field(s) Selected • Automatic Extraction-First Discovery
+              </span>
               <button
                 onClick={handleStartDiscovery}
                 className="px-6 py-2.5 rounded-xl bg-[#1677FF] hover:bg-[#0A6ED1] text-white text-xs font-semibold flex items-center gap-2 shadow-xs"
               >
-                Continue ({authoritativeFields.length} Authoritative Fields) <ArrowRight className="w-4 h-4" />
+                Continue to Discovery ({authoritativeFields.length} Fields) <ArrowRight className="w-4 h-4" />
               </button>
             </div>
           </div>
@@ -3178,125 +3467,260 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
             </div>
           )}
 
-          {/* Solution Decision Card (Section 2 & 10) */}
+          {/* Solution Decision Card - Strict Extraction-First Outcome A vs Outcome B */}
           {computedSolutionDecision && (
             <div
-              className={`p-5 rounded-2xl border shadow-xs space-y-3 ${
+              className={`p-5 rounded-2xl border shadow-xs space-y-4 ${
+                computedSolutionDecision.solution_type === 'EXISTING_EXTRACTION_ENABLED_CDS' ||
                 computedSolutionDecision.solution_type === 'REUSE_EXISTING'
-                  ? 'bg-[#E8F8F3]/80 border-[#00A878]/50 text-[#0F2747]'
-                  : computedSolutionDecision.solution_type === 'MULTI_CDS_CREATE'
+                  ? 'bg-[#E8F8F3]/90 border-[#00A878]/60 text-[#0F2747]'
+                  : computedSolutionDecision.solution_type === 'CUSTOM_WRAPPER_REQUIRED' ||
+                    computedSolutionDecision.solution_type === 'MULTI_CDS_CREATE' ||
+                    computedSolutionDecision.solution_type === 'SINGLE_CDS_WRAPPER_REQUIRED'
                   ? 'bg-[#F4F8FC] border-[#0A6ED1]/40 text-[#0F2747]'
                   : 'bg-amber-50 border-amber-300 text-amber-900'
               }`}
             >
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div className="flex items-center gap-2">
-                  <span
-                    className={`px-3 py-1 rounded-full text-xs font-bold font-mono tracking-wide ${
-                      computedSolutionDecision.solution_type === 'REUSE_EXISTING'
-                        ? 'bg-[#00A878] text-white'
-                        : computedSolutionDecision.solution_type === 'MULTI_CDS_CREATE'
-                        ? 'bg-[#0A6ED1] text-white'
-                        : 'bg-amber-600 text-white'
-                    }`}
-                  >
-                    SOLUTION: {computedSolutionDecision.solution_type}
-                  </span>
-                  <span className="text-xs font-bold text-[#0F2747]">
-                    {computedSolutionDecision.solution_type === 'REUSE_EXISTING'
-                      ? '★ REUSE EXISTING CDS (100% Coverage Satisfied)'
-                      : computedSolutionDecision.solution_type === 'MULTI_CDS_CREATE'
-                      ? '⚡ CREATE NEW CDS FROM MULTIPLE CDS VIEWS'
-                      : '⚠ NO VALID CDS SOLUTION'}
-                  </span>
-                </div>
+              {/* Outcome A: Existing Extraction-Enabled BASIC CDS Available */}
+              {(computedSolutionDecision.solution_type === 'EXISTING_EXTRACTION_ENABLED_CDS' ||
+                computedSolutionDecision.solution_type === 'REUSE_EXISTING') && (
+                <div className="space-y-4">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="flex items-center gap-2">
+                      <span className="px-3 py-1 rounded-full text-xs font-bold font-mono tracking-wide bg-[#00A878] text-white flex items-center gap-1.5">
+                        <CheckCircle2 className="w-3.5 h-3.5" /> OUTCOME A: EXISTING EXTRACTION AVAILABLE
+                      </span>
+                      <span className="text-xs font-bold text-[#0F2747]">
+                        ★ EXISTING EXTRACTION-ENABLED CDS AVAILABLE (100% Coverage Satisfied)
+                      </span>
+                    </div>
 
-                {computedSolutionDecision.solution_type === 'REUSE_EXISTING' && computedSolutionDecision.candidate && (
-                  <button
-                    onClick={() => handleUseSingleCdsReuse(computedSolutionDecision.candidate)}
-                    className="px-5 py-2 rounded-xl bg-[#00A878] hover:bg-[#00A878]/90 text-white text-xs font-bold flex items-center gap-1.5 shadow-xs"
-                  >
-                    <CheckCircle2 className="w-4 h-4" /> [USE THIS CDS]
-                  </button>
-                )}
-
-                {computedSolutionDecision.solution_type === 'MULTI_CDS_CREATE' && (
-                  <button
-                    onClick={() => {
-                      if (computedSolutionDecision.candidate) {
-                        const candId = getCandidateId(computedSolutionDecision.candidate);
-                        if (!selectedCandidateIds.includes(candId)) {
-                          setSelectedCandidateIds([candId]);
-                        }
-                      }
-                      setActiveStep(4);
-                    }}
-                    className="px-5 py-2 rounded-xl bg-[#1677FF] hover:bg-[#0A6ED1] text-white text-xs font-bold flex items-center gap-1.5 shadow-xs"
-                  >
-                    [CONTINUE TO MAPPING] <ArrowRight className="w-4 h-4" />
-                  </button>
-                )}
-              </div>
-
-              <p className="text-xs text-[#5F7187] font-medium">{computedSolutionDecision.message}</p>
-
-              {computedSolutionDecision.solution_type === 'NO_SOLUTION' && discoveryStats?.extraction_filtering?.filter_active && (
-                <div className="pt-2 flex flex-wrap items-center gap-3">
-                  <button
-                    onClick={() => {
-                      setExtractionEnabledOnly(false);
-                      setRequireDeltaSupport(false);
-                      handleStartDiscovery(false);
-                    }}
-                    className="px-4 py-2 rounded-xl bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold flex items-center gap-1.5 shadow-xs transition"
-                  >
-                    <RefreshCw className="w-3.5 h-3.5" /> Re-run Discovery Without Extraction Filter
-                  </button>
-                </div>
-              )}
-
-              {computedSolutionDecision.solution_type === 'REUSE_EXISTING' && (
-                <div className="flex flex-wrap items-center gap-4 text-xs font-mono pt-1 text-[#172B4D]">
-                  <div>
-                    <span className="text-[#5F7187]">Approved Existing CDS:</span>{' '}
-                    <span className="text-[#0A6ED1] font-bold">{computedSolutionDecision.cds}</span>
+                    <button
+                      onClick={() => {
+                        const targetCand = computedSolutionDecision.candidate || allCandidates.find(c => c.cds_name === computedSolutionDecision.cds) || allCandidates[0];
+                        if (targetCand) handleConfirmExistingCdsSelection(targetCand);
+                      }}
+                      className="px-5 py-2.5 rounded-xl bg-[#00A878] hover:bg-[#00A878]/90 text-white text-xs font-bold flex items-center gap-2 shadow-xs transition"
+                    >
+                      <CheckCircle2 className="w-4 h-4" /> SELECT EXISTING CDS →
+                    </button>
                   </div>
-                  <div>
-                    <span className="text-[#5F7187]">Coverage:</span>{' '}
-                    <span className="text-[#00A878] font-bold">100%</span>
-                  </div>
-                  <div>
-                    <span className="text-[#5F7187]">Status:</span>{' '}
-                    <span className="text-[#00A878] font-semibold">All required fields verified in SAP ADT</span>
-                  </div>
-                </div>
-              )}
 
-              {computedSolutionDecision.solution_type === 'MULTI_CDS_CREATE' && (
-                <div className="space-y-1.5 pt-1 text-xs font-mono">
-                  <div className="flex items-center gap-2">
-                    <span className="text-[#5F7187]">Required Views:</span>
-                    <span className="text-[#0A6ED1] font-bold">
-                      {Array.isArray(computedSolutionDecision.cds)
-                        ? computedSolutionDecision.cds.join(', ')
-                        : computedSolutionDecision.cds}
-                    </span>
-                    <span className="text-[#00A878] font-bold">({computedSolutionDecision.coverage}% Combined Coverage)</span>
+                  <p className="text-xs text-[#0F2747] font-medium leading-relaxed">
+                    Existing SAP CDS view <span className="font-mono font-bold text-[#0A6ED1]">{computedSolutionDecision.cds}</span> satisfies 100% of required fields with data extraction enabled in standard SAP (authoritatively verified in <code className="bg-white/80 px-1 py-0.5 rounded border border-[#00A878]/30 font-mono text-[11px]">I_DataExtractionEnabledView</code>). Direct reuse is approved without custom wrapper creation.
+                  </p>
+
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-1 text-xs font-mono">
+                    <div className="bg-white/80 p-2.5 rounded-xl border border-[#00A878]/30">
+                      <div className="text-[10px] text-[#5F7187] uppercase font-semibold">Approved CDS View</div>
+                      <div className="text-[#0A6ED1] font-bold text-xs truncate mt-0.5">{computedSolutionDecision.cds}</div>
+                    </div>
+                    <div className="bg-white/80 p-2.5 rounded-xl border border-[#00A878]/30">
+                      <div className="text-[10px] text-[#5F7187] uppercase font-semibold">Field Coverage</div>
+                      <div className="text-[#00A878] font-bold text-xs mt-0.5">100% Verified</div>
+                    </div>
+                    <div className="bg-white/80 p-2.5 rounded-xl border border-[#00A878]/30">
+                      <div className="text-[10px] text-[#5F7187] uppercase font-semibold">Extraction Status</div>
+                      <div className="text-emerald-700 font-bold text-xs mt-0.5 flex items-center gap-1">
+                        <Check className="w-3 h-3 text-emerald-600" /> Enabled in SAP
+                      </div>
+                    </div>
+                    <div className="bg-white/80 p-2.5 rounded-xl border border-[#00A878]/30">
+                      <div className="text-[10px] text-[#5F7187] uppercase font-semibold">Classification</div>
+                      <div className="text-indigo-700 font-bold text-xs mt-0.5">BASIC (No Params)</div>
+                    </div>
                   </div>
-                  {computedSolutionDecision.join_path && computedSolutionDecision.join_path.length > 0 && (
-                    <div className="p-2 rounded bg-white border border-[#D9E4F0] text-[11px] text-[#172B4D]">
-                      <span className="font-semibold text-indigo-700">Verified Join Path:</span>{' '}
-                      {computedSolutionDecision.join_path.map((jp: any, i: number) => (
-                        <span key={i} className="mr-2">
-                          {jp.left_view} ↓ ON {jp.left_field} = {jp.right_field} ↓ {jp.right_view}
+
+                  {/* Domain, Description & Source DDL Verification Action */}
+                  <div className="flex flex-wrap items-center justify-between gap-2 pt-1 text-xs bg-white/60 p-2.5 rounded-xl border border-[#00A878]/20">
+                    <div className="flex flex-wrap items-center gap-3">
+                      <div>
+                        <span className="text-[#5F7187] text-[11px] font-semibold">Domain:</span>{' '}
+                        <span className="font-semibold text-[#0F2747]">
+                          {computedSolutionDecision.candidate?.domain || computedSolutionDecision.domain || selectedDomains.join(', ') || 'Sales & Distribution'}
                         </span>
+                      </div>
+                      <div>
+                        <span className="text-[#5F7187] text-[11px] font-semibold">Description:</span>{' '}
+                        <span className="text-[#172B4D]">
+                          {computedSolutionDecision.candidate?.description || computedSolutionDecision.description || 'Verified SAP CDS View Entity'}
+                        </span>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => handleOpenLiveSource(computedSolutionDecision.cds)}
+                      className="px-3 py-1.5 rounded-lg bg-white border border-[#00A878]/40 hover:bg-emerald-50 text-[#0A6ED1] text-xs font-mono font-medium flex items-center gap-1.5 transition shadow-2xs"
+                      title="Inspect genuine ADT DDL source from SAP"
+                    >
+                      <FileText className="w-3.5 h-3.5 text-[#0A6ED1]" /> View Source DDL
+                    </button>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-1.5 pt-1">
+                    <span className="text-[11px] text-[#5F7187] font-medium">Available Required Fields ({authoritativeFields.length}):</span>
+                    {authoritativeFields.map((f) => (
+                      <span key={f.name} className="px-2 py-0.5 rounded-md bg-[#E8F8F3] text-emerald-800 border border-[#00A878]/40 text-[11px] font-mono">
+                        ✓ {f.name}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Outcome B: Custom Wrapper Required */}
+              {(computedSolutionDecision.solution_type === 'CUSTOM_WRAPPER_REQUIRED' ||
+                computedSolutionDecision.solution_type === 'MULTI_CDS_CREATE' ||
+                computedSolutionDecision.solution_type === 'SINGLE_CDS_WRAPPER_REQUIRED') && (
+                <div className="space-y-4">
+                  <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#0A6ED1]/20 pb-3">
+                    <div className="flex flex-wrap items-center gap-2.5">
+                      <span className="px-3 py-1 rounded-full text-xs font-bold font-mono tracking-wide bg-[#0A6ED1] text-white flex items-center gap-1.5 shadow-xs">
+                        <Zap className="w-3.5 h-3.5" /> CUSTOM WRAPPER REQUIRED
+                      </span>
+                      <h3 className="text-xs font-bold text-[#0F2747] uppercase tracking-wider">
+                        Part A: Why is a Custom Wrapper Required? ({computedSolutionDecision.coverage || 100}% Field Coverage)
+                      </h3>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      {selectedViews.length > 0 ? (
+                        <button
+                          onClick={handleConfirmSelectionAndJoin}
+                          className="px-5 py-2.5 rounded-xl bg-[#1677FF] hover:bg-[#0A6ED1] text-white text-xs font-bold flex items-center gap-1.5 shadow-xs transition"
+                        >
+                          CONFIRM CDS SELECTION &amp; JOINS ({selectedViews.length} Views) <ArrowRight className="w-4 h-4" />
+                        </button>
+                      ) : (
+                        <button
+                          onClick={() => {
+                            if (computedSolutionDecision.candidate) {
+                              toggleCandidateSelection(computedSolutionDecision.candidate);
+                            } else if (allCandidates.length > 0) {
+                              toggleCandidateSelection(allCandidates[0]);
+                            }
+                          }}
+                          className="px-4 py-2 rounded-xl bg-[#0A6ED1] hover:bg-[#0A6ED1]/90 text-white text-xs font-bold flex items-center gap-1.5 shadow-xs transition"
+                        >
+                          <Plus className="w-3.5 h-3.5" /> Auto-Select Recommended Candidate
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Dynamic Explanation of why existing extraction views are insufficient */}
+                  <div className="p-3.5 rounded-xl bg-white border border-[#0A6ED1]/30 text-xs text-[#0F2747] leading-relaxed">
+                    <span className="font-bold text-[#0A6ED1] flex items-center gap-1.5 mb-1">
+                      <AlertCircle className="w-3.5 h-3.5 text-[#0A6ED1]" />
+                      Why Existing Extraction Candidates are Insufficient:
+                    </span>
+                    <p className="text-[#5F7187]">
+                      {computedSolutionDecision.insufficient_extraction_explanation ||
+                        computedSolutionDecision.message ||
+                        'No single extraction-enabled CDS view satisfies all required business fields. A custom extraction wrapper combining verified BASIC views is required.'}
+                    </p>
+                  </div>
+
+                  {/* Missing Fields List (if any) */}
+                  {computedSolutionDecision.missing_fields && computedSolutionDecision.missing_fields.length > 0 && (
+                    <div className="p-3 rounded-xl bg-amber-50/80 border border-amber-200 text-xs">
+                      <div className="font-semibold text-amber-900 mb-1 flex items-center gap-1.5">
+                        <span>Missing Fields in Standard Single Views:</span>
+                      </div>
+                      <div className="flex flex-wrap gap-1.5">
+                        {computedSolutionDecision.missing_fields.map((mf: string) => (
+                          <span key={mf} className="px-2 py-0.5 rounded bg-white text-amber-800 border border-amber-300 font-mono text-[11px]">
+                            {mf}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Eligible Verified BASIC Source Views */}
+                  <div className="space-y-2 pt-1 text-xs">
+                    <div className="flex items-center gap-2">
+                      <span className="text-[#5F7187] font-semibold">Eligible Verified BASIC Source Views:</span>
+                      <span className="text-[11px] text-[#5F7187]">(Extraction will be enabled in custom wrapper)</span>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      {(Array.isArray(computedSolutionDecision.eligible_basic_source_views)
+                        ? computedSolutionDecision.eligible_basic_source_views
+                        : Array.isArray(computedSolutionDecision.cds)
+                        ? computedSolutionDecision.cds
+                        : [computedSolutionDecision.cds]
+                      ).filter(Boolean).map((vName: string) => (
+                        <div key={vName} className="flex items-center gap-2 bg-white px-3 py-1.5 rounded-xl border border-[#D9E4F0] font-mono text-xs">
+                          <span className="text-[#0A6ED1] font-bold">{vName}</span>
+                          <span className="text-[10px] bg-emerald-50 text-emerald-700 px-1.5 py-0.5 rounded border border-emerald-200 font-sans font-semibold">
+                            @VDM.viewType: #BASIC
+                          </span>
+                          <span className="text-[10px] bg-blue-50 text-blue-700 px-1.5 py-0.5 rounded border border-blue-200 font-sans">
+                            Non-Parameterized
+                          </span>
+                        </div>
                       ))}
+                    </div>
+
+                    {computedSolutionDecision.join_path && computedSolutionDecision.join_path.length > 0 && (
+                      <div className="p-2.5 rounded-xl bg-white border border-[#D9E4F0] text-[11px] text-[#172B4D] font-mono">
+                        <span className="font-semibold text-indigo-700 font-sans">Verified Join Path:</span>{' '}
+                        {computedSolutionDecision.join_path.map((jp: any, i: number) => (
+                          <span key={i} className="mr-2">
+                            {jp.left_view} ↓ ON {jp.left_field} = {jp.right_field} ↓ {jp.right_view}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* Outcome C: No Solution */}
+              {computedSolutionDecision.solution_type === 'NO_SOLUTION' && (
+                <div className="space-y-3">
+                  <div className="flex items-center gap-2">
+                    <span className="px-3 py-1 rounded-full text-xs font-bold font-mono tracking-wide bg-amber-600 text-white">
+                      NO VALID CDS SOLUTION
+                    </span>
+                    <span className="text-xs font-bold text-amber-900">
+                      ⚠ No verified CDS candidate covers the required business fields
+                    </span>
+                  </div>
+                  <p className="text-xs text-amber-800">{computedSolutionDecision.message}</p>
+                  {discoveryStats?.extraction_filtering?.filter_active && (
+                    <div className="pt-1">
+                      <button
+                        onClick={() => {
+                          setExtractionEnabledOnly(false);
+                          setRequireDeltaSupport(false);
+                          handleStartDiscovery(false);
+                        }}
+                        className="px-4 py-2 rounded-xl bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold flex items-center gap-1.5 shadow-xs transition"
+                      >
+                        <RefreshCw className="w-3.5 h-3.5" /> Re-run Discovery Without Extraction Filter
+                      </button>
                     </div>
                   )}
                 </div>
               )}
             </div>
           )}
+
+          {/* Part B: Available BASIC Source CDS Views */}
+          <div className="pt-2 border-t border-[#D9E4F0] space-y-1">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h3 className="text-xs font-bold text-[#0F2747] uppercase tracking-wider flex items-center gap-2">
+                <Layers className="w-4 h-4 text-[#0A6ED1]" /> Part B: Available BASIC Source CDS Views
+              </h3>
+              <span className="text-[10px] bg-blue-50 text-blue-700 font-bold px-2 py-0.5 rounded border border-blue-200">
+                Verified BASIC &amp; Non-Parameterized Only
+              </span>
+            </div>
+            <p className="text-xs text-[#5F7187]">
+              Inspect verified BASIC CDS View Entities discovered in selected business domains. Select one or more views to use as sources for your custom extraction wrapper.
+            </p>
+          </div>
 
           {/* Search Bar Across ALL Candidates (Section 18) & Multi-Filters (Section 19) */}
           <div className="space-y-3">
@@ -3533,142 +3957,458 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
             )}
           </div>
 
-          {/* Stepper Navigation */}
-          <div className="flex items-center justify-between pt-4 border-t border-[#D9E4F0]">
-            <button
-              onClick={() => setActiveStep(1)}
-              className="px-4 py-2 rounded-lg border border-[#D9E4F0] hover:bg-[#F4F8FC] text-xs text-[#0F2747] font-medium flex items-center gap-1.5"
-            >
-              <ArrowLeft className="w-3.5 h-3.5" /> Back to Required Fields
-            </button>
-            <button
-              onClick={() => setActiveStep(4)} // Step 5: CDS Selection
-              className="px-6 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold flex items-center gap-2 shadow-lg shadow-blue-600/20"
-            >
-              Continue to CDS Selection ({selectedCandidateIds.length} Selected) <ArrowRight className="w-4 h-4" />
-            </button>
+          {/* Part C: Select Source CDS Views & Output Fields */}
+          {selectedViews.length > 0 && (
+            <div className="space-y-4 pt-2 border-t border-[#D9E4F0]">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <h3 className="text-xs font-bold text-[#0F2747] uppercase tracking-wider flex items-center gap-2">
+                  <Layers className="w-4 h-4 text-[#0A6ED1]" /> Part C: Select Source CDS Views &amp; Output Fields
+                </h3>
+                <span className="text-[10px] bg-emerald-50 text-emerald-700 font-bold px-2 py-0.5 rounded border border-emerald-300">
+                  Verified BASIC Views Selected ({selectedViews.length})
+                </span>
+              </div>
+
+              {/* Selected Source CDS Views Summary Chips */}
+              <div className="p-4 rounded-xl bg-[#F4F8FC] border border-[#0A6ED1]/30 space-y-2">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-bold text-[#0F2747]">
+                      Selected Source CDS Views ({selectedViews.length})
+                    </span>
+                    <span className="text-[10px] bg-emerald-50 text-emerald-700 font-bold px-2 py-0.5 rounded border border-emerald-300">
+                      Verified BASIC Only
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSelectedCandidateIds([]);
+                      syncSelectionState([]);
+                    }}
+                    className="text-[11px] text-[#5F7187] hover:text-red-600 transition"
+                  >
+                    Clear All Selections
+                  </button>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2 pt-1">
+                  {selectedViews.map((v) => (
+                    <span
+                      key={v}
+                      className="inline-flex items-center gap-1.5 px-3 py-1 rounded-lg bg-white border border-[#D9E4F0] text-xs font-mono font-bold text-[#0F2747] shadow-2xs"
+                    >
+                      <span>{v}</span>
+                      <span className="text-[9px] bg-emerald-100 text-emerald-800 px-1 rounded font-sans font-semibold">
+                        BASIC
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => handleRemoveSelectedView(v)}
+                        className="text-[#5F7187] hover:text-red-600 ml-1 rounded p-0.5 hover:bg-red-50"
+                        title={`Remove ${v}`}
+                      >
+                        <X className="w-3 h-3" />
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              </div>
+
+              {/* Field Selection & Output Schema Table */}
+              {selectedOutputFields.length > 0 && (
+                <div className="p-5 rounded-2xl bg-white border border-[#D9E4F0] shadow-xs space-y-4">
+                  <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#D9E4F0] pb-3">
+                    <div className="flex items-center gap-2">
+                      <Table className="w-4 h-4 text-[#0A6ED1]" />
+                      <div>
+                        <h4 className="text-xs font-bold text-[#0F2747]">
+                          Field Selection &amp; Output Schema (HITL Gate)
+                        </h4>
+                        <p className="text-[11px] text-[#5F7187]">
+                          Select which business and technical fields will be projected into the generated custom wrapper.
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-xs bg-[#F4F8FC] border border-[#D9E4F0] text-[#0A6ED1] px-2.5 py-1 rounded-lg font-mono font-bold">
+                        Selected: {selectedOutputFields.filter((f) => f.selected).length} / {selectedOutputFields.length}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={handleSelectAllRequiredFields}
+                        className="px-2.5 py-1 rounded-lg bg-white border border-[#D9E4F0] hover:bg-[#F4F8FC] text-[#0F2747] text-xs font-medium"
+                      >
+                        Required Only
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleSelectAllAvailableFields}
+                        className="px-2.5 py-1 rounded-lg bg-white border border-[#D9E4F0] hover:bg-[#F4F8FC] text-[#0F2747] text-xs font-medium"
+                      >
+                        Select All
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleClearFieldSelection}
+                        className="px-2.5 py-1 rounded-lg bg-white border border-[#D9E4F0] hover:bg-red-50 text-red-600 text-xs font-medium"
+                      >
+                        Clear
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="rounded-xl border border-[#D9E4F0] overflow-hidden max-h-[360px] overflow-y-auto">
+                    <table className="w-full text-xs">
+                      <thead className="bg-[#F4F8FC] text-[#5F7187] text-left border-b border-[#D9E4F0] sticky top-0 z-10">
+                        <tr>
+                          <th className="p-2.5 w-10 text-center">Select</th>
+                          <th className="p-2.5">Field Name</th>
+                          <th className="p-2.5">Source CDS</th>
+                          <th className="p-2.5">Data Type</th>
+                          <th className="p-2.5">Length</th>
+                          <th className="p-2.5 text-center">Key</th>
+                          <th className="p-2.5">Description / Lineage</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-[#D9E4F0]">
+                        {selectedOutputFields.map((f) => (
+                          <tr
+                            key={f.id}
+                            className={`transition hover:bg-[#F4F8FC]/60 ${
+                              f.selected ? 'bg-[#F4F8FC]/30' : 'opacity-70'
+                            }`}
+                          >
+                            <td className="p-2.5 text-center">
+                              <input
+                                type="checkbox"
+                                checked={f.selected}
+                                onChange={() => handleToggleFieldSelection(f.id)}
+                                className="w-4 h-4 rounded text-[#0A6ED1] focus:ring-0 cursor-pointer"
+                              />
+                            </td>
+                            <td className="p-2.5">
+                              <div className="font-semibold text-[#0F2747]">{f.business_field}</div>
+                              {f.actual_field !== f.business_field && (
+                                <div className="text-[10px] font-mono text-[#5F7187]">{f.actual_field}</div>
+                              )}
+                            </td>
+                            <td className="p-2.5">
+                              <span className="font-mono text-[11px] font-bold text-[#0A6ED1] bg-white border border-[#D9E4F0] px-1.5 py-0.5 rounded">
+                                {f.source_cds}
+                              </span>
+                            </td>
+                            <td className="p-2.5 font-mono text-purple-700 font-medium">
+                              {f.data_type}
+                            </td>
+                            <td className="p-2.5 font-mono text-[#5F7187]">
+                              {f.length || '—'}
+                            </td>
+                            <td className="p-2.5 text-center">
+                              <input
+                                type="checkbox"
+                                checked={f.is_key}
+                                onChange={() => handleToggleFieldKey(f.id)}
+                                className="w-3.5 h-3.5 rounded text-amber-600 focus:ring-0 cursor-pointer"
+                                title="Primary Key Column"
+                              />
+                            </td>
+                            <td className="p-2.5 text-[#5F7187] text-[11px]">
+                              {f.evidence || f.field_label}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Part D: Configure Joins & Relationships (HITL Gate) */}
+          {selectedViews.length === 1 && (
+            <div className="p-3.5 rounded-xl bg-[#F4F8FC] border border-[#D9E4F0] text-xs text-[#5F7187] flex items-center gap-2">
+              <GitBranch className="w-4 h-4 text-[#0A6ED1] shrink-0" />
+              <span>
+                Part D: Single CDS wrapper — Direct 1-to-1 projection from verified BASIC view <strong className="font-mono text-[#0A6ED1]">{selectedViews[0]}</strong> without joins.
+              </span>
+            </div>
+          )}
+
+          {selectedViews.length > 1 && (
+            <div className="p-5 rounded-2xl bg-white border border-[#0A6ED1]/40 shadow-xs space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#D9E4F0] pb-3">
+                <div className="flex items-center gap-2">
+                  <GitBranch className="w-4 h-4 text-[#0A6ED1]" />
+                  <div>
+                    <h3 className="text-xs font-bold text-[#0F2747] uppercase tracking-wider">
+                      Part D: Configure Joins &amp; Relationships (HITL Gate)
+                    </h3>
+                    <p className="text-[11px] text-[#5F7187]">
+                      Define table relationships and join types between selected BASIC CDS views.
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleAddJoinRow}
+                  className="px-3 py-1.5 rounded-lg bg-[#F4F8FC] hover:bg-[#D9E4F0]/60 text-[#0A6ED1] border border-[#0A6ED1]/30 text-xs font-bold flex items-center gap-1 transition"
+                >
+                  <Plus className="w-3.5 h-3.5" /> Add Join Relationship
+                </button>
+              </div>
+
+              {/* Unjoined Views Warning */}
+              {selectedViews.some((v) => !userJoinConfigurations.some((j) => j.left_view === v || j.right_view === v)) && (
+                <div className="p-2.5 rounded-lg bg-amber-50 border border-amber-200 text-[11px] text-amber-800 flex items-center gap-1.5">
+                  <AlertCircle className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                  <span>
+                    Notice: Some selected views (
+                    {selectedViews
+                      .filter((v) => !userJoinConfigurations.some((j) => j.left_view === v || j.right_view === v))
+                      .join(', ')}
+                    ) are not yet connected in the join path.
+                  </span>
+                </div>
+              )}
+
+              {/* Join Rows */}
+              <div className="space-y-3">
+                {userJoinConfigurations.map((j, idx) => (
+                  <div
+                    key={j.id}
+                    className="p-3.5 rounded-xl bg-[#F4F8FC]/80 border border-[#D9E4F0] space-y-2.5"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex items-center gap-2">
+                        <span className="text-[11px] font-mono font-bold text-[#5F7187]">
+                          Join #{idx + 1}
+                        </span>
+                        {j.is_sap_verified ? (
+                          <span className="text-[10px] bg-emerald-50 text-emerald-700 font-bold px-2 py-0.5 rounded border border-emerald-300 flex items-center gap-1">
+                            <CheckCircle className="w-3 h-3 text-emerald-600" /> SAP-Verified Relationship
+                          </span>
+                        ) : (
+                          <span className="text-[10px] bg-blue-50 text-blue-700 font-bold px-2 py-0.5 rounded border border-blue-300 flex items-center gap-1">
+                            <Zap className="w-3 h-3 text-blue-600" /> User-Proposed Relationship
+                          </span>
+                        )}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteJoinRow(j.id)}
+                        className="text-[#5F7187] hover:text-red-600 text-[11px] flex items-center gap-1 transition"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" /> Remove
+                      </button>
+                    </div>
+
+                    {/* Join Controls Grid */}
+                    {(() => {
+                      const leftFields = getViewFields(j.left_view);
+                      const rightFields = getViewFields(j.right_view);
+
+                      return (
+                        <div className="grid grid-cols-1 md:grid-cols-5 gap-3 items-start text-xs">
+                          {/* 1. Left View */}
+                          <div>
+                            <label className="text-[10px] text-[#5F7187] font-semibold block mb-1">Left View</label>
+                            <select
+                              value={j.left_view}
+                              onChange={(e) => handleUpdateJoinRow(j.id, { left_view: e.target.value, is_sap_verified: false })}
+                              className="w-full bg-white border border-[#D9E4F0] rounded-lg px-2 py-1.5 text-xs font-mono font-bold text-[#0F2747] outline-none"
+                            >
+                              {selectedViews.map((v) => (
+                                <option key={v} value={v}>
+                                  {v}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+
+                          {/* 2. Left Field Dropdown & Custom Edit */}
+                          <div>
+                            <div className="flex items-center justify-between mb-1">
+                              <label className="text-[10px] text-[#5F7187] font-semibold">Left Field (ON)</label>
+                              <span className="text-[9px] text-[#0A6ED1] font-mono truncate max-w-[85px]">{j.left_view}</span>
+                            </div>
+                            <select
+                              value={leftFields.includes(j.left_field) ? j.left_field : '__custom__'}
+                              onChange={(e) => {
+                                if (e.target.value !== '__custom__') {
+                                  handleUpdateJoinRow(j.id, { left_field: e.target.value, is_sap_verified: false });
+                                }
+                              }}
+                              className="w-full bg-white border border-[#D9E4F0] rounded-lg px-2 py-1.5 text-xs font-mono text-[#0A6ED1] outline-none font-semibold mb-1"
+                              title={`Select technical field from ${j.left_view}`}
+                            >
+                              <option value="" disabled>-- Select {j.left_view} Field --</option>
+                              {leftFields.map((fld) => (
+                                <option key={fld} value={fld}>
+                                  {fld}
+                                </option>
+                              ))}
+                              {!leftFields.includes(j.left_field) && j.left_field && (
+                                <option value="__custom__">
+                                  {j.left_field} (Custom)
+                                </option>
+                              )}
+                            </select>
+                            <input
+                              type="text"
+                              value={j.left_field}
+                              onChange={(e) => handleUpdateJoinRow(j.id, { left_field: e.target.value, is_sap_verified: false })}
+                              placeholder="Or edit field name..."
+                              className="w-full bg-[#F4F8FC] border border-[#D9E4F0] rounded-lg px-2 py-1 text-[11px] font-mono text-[#0F2747] outline-none"
+                              title="Directly edit or type custom field name"
+                            />
+                          </div>
+
+                          {/* 3. Join Type */}
+                          <div>
+                            <label className="text-[10px] text-[#5F7187] font-semibold block mb-1">Join Type</label>
+                            <select
+                              value={j.join_type}
+                              onChange={(e) => handleUpdateJoinRow(j.id, { join_type: e.target.value })}
+                              className="w-full bg-white border border-[#D9E4F0] rounded-lg px-2 py-1.5 text-xs font-mono font-bold text-indigo-700 outline-none"
+                            >
+                              <option value="INNER JOIN">INNER JOIN</option>
+                              <option value="LEFT OUTER JOIN">LEFT OUTER JOIN</option>
+                            </select>
+                          </div>
+
+                          {/* 4. Right View */}
+                          <div>
+                            <label className="text-[10px] text-[#5F7187] font-semibold block mb-1">Right View</label>
+                            <select
+                              value={j.right_view}
+                              onChange={(e) => handleUpdateJoinRow(j.id, { right_view: e.target.value, is_sap_verified: false })}
+                              className="w-full bg-white border border-[#D9E4F0] rounded-lg px-2 py-1.5 text-xs font-mono font-bold text-[#0F2747] outline-none"
+                            >
+                              {selectedViews.map((v) => (
+                                <option key={v} value={v}>
+                                  {v}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+
+                          {/* 5. Right Field Dropdown & Custom Edit */}
+                          <div>
+                            <div className="flex items-center justify-between mb-1">
+                              <label className="text-[10px] text-[#5F7187] font-semibold">Right Field (=)</label>
+                              <span className="text-[9px] text-[#0A6ED1] font-mono truncate max-w-[85px]">{j.right_view}</span>
+                            </div>
+                            <select
+                              value={rightFields.includes(j.right_field) ? j.right_field : '__custom__'}
+                              onChange={(e) => {
+                                if (e.target.value !== '__custom__') {
+                                  handleUpdateJoinRow(j.id, { right_field: e.target.value, is_sap_verified: false });
+                                }
+                              }}
+                              className="w-full bg-white border border-[#D9E4F0] rounded-lg px-2 py-1.5 text-xs font-mono text-[#0A6ED1] outline-none font-semibold mb-1"
+                              title={`Select technical field from ${j.right_view}`}
+                            >
+                              <option value="" disabled>-- Select {j.right_view} Field --</option>
+                              {rightFields.map((fld) => (
+                                <option key={fld} value={fld}>
+                                  {fld}
+                                </option>
+                              ))}
+                              {!rightFields.includes(j.right_field) && j.right_field && (
+                                <option value="__custom__">
+                                  {j.right_field} (Custom)
+                                </option>
+                              )}
+                            </select>
+                            <input
+                              type="text"
+                              value={j.right_field}
+                              onChange={(e) => handleUpdateJoinRow(j.id, { right_field: e.target.value, is_sap_verified: false })}
+                              placeholder="Or edit field name..."
+                              className="w-full bg-[#F4F8FC] border border-[#D9E4F0] rounded-lg px-2 py-1 text-[11px] font-mono text-[#0F2747] outline-none"
+                              title="Directly edit or type custom field name"
+                            />
+                          </div>
+                        </div>
+                      );
+                    })()}
+
+                    {/* Suggested Join Key Pills */}
+                    <div className="flex flex-wrap items-center gap-1.5 pt-1 text-[11px]">
+                      <span className="text-[#5F7187] text-[10px] font-semibold">Suggested Join Keys:</span>
+                      {['SalesOrder', 'Customer', 'SoldToParty', 'CompanyCode', 'Material', 'BillingDocument'].map((k) => (
+                        <button
+                          key={k}
+                          type="button"
+                          onClick={() => handleUpdateJoinRow(j.id, { left_field: k, right_field: k, is_sap_verified: false })}
+                          className="px-2 py-0.5 rounded bg-white hover:bg-[#0A6ED1]/10 text-[#0A6ED1] border border-[#D9E4F0] font-mono text-[10px] transition"
+                        >
+                          +{k}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Part E: Confirm Selection & Proceed to Mapping */}
+          <div className="pt-4 border-t border-[#D9E4F0] space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h3 className="text-xs font-bold text-[#0F2747] uppercase tracking-wider">
+                Part E: Confirm Selection &amp; Proceed to Mapping
+              </h3>
+              <span className="text-[11px] text-[#5F7187]">
+                Navigates directly to Mapping with verified selections and joins
+              </span>
+            </div>
+            <div className="flex items-center justify-between">
+              <button
+                onClick={() => setActiveStep(1)}
+                className="px-4 py-2 rounded-lg border border-[#D9E4F0] hover:bg-[#F4F8FC] text-xs text-[#0F2747] font-medium flex items-center gap-1.5"
+              >
+                <ArrowLeft className="w-3.5 h-3.5" /> Back to Required Fields
+              </button>
+
+              {(computedSolutionDecision?.solution_type === 'EXISTING_EXTRACTION_ENABLED_CDS' ||
+                computedSolutionDecision?.solution_type === 'REUSE_EXISTING') ? (
+                <button
+                  onClick={() => {
+                    const targetCand = computedSolutionDecision.candidate || allCandidates.find(c => c.cds_name === computedSolutionDecision.cds) || allCandidates[0];
+                    if (targetCand) handleConfirmExistingCdsSelection(targetCand);
+                  }}
+                  className="px-6 py-2.5 rounded-xl bg-[#00A878] hover:bg-[#00A878]/90 text-white text-xs font-bold flex items-center gap-2 shadow-xs transition"
+                >
+                  <CheckCircle2 className="w-4 h-4" /> SELECT EXISTING CDS →
+                </button>
+              ) : (
+                <button
+                  onClick={handleConfirmSelectionAndJoin}
+                  disabled={selectedCandidateIds.length === 0}
+                  className="px-6 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white text-xs font-bold flex items-center gap-2 shadow-lg shadow-blue-600/20 transition"
+                >
+                  CONFIRM CDS SELECTION AND JOIN CONFIGURATION ({selectedViews.length} Views, {selectedOutputFields.filter((f) => f.selected).length} Fields) <ArrowRight className="w-4 h-4" />
+                </button>
+              )}
+            </div>
           </div>
         </div>
       )}
 
-      {/* STEP 5: CDS SELECTION (HITL GATE 2 - Section 26 - INDEPENDENT SELECTION) */}
+      {/* CDS Selection now integrated directly into Step 4 (Recommendations & Selection) */}
       {activeStep === 4 && (
-        <div className="bg-white border border-[#D9E4F0] rounded-2xl p-6 space-y-6 shadow-sm">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2.5">
-              <ShieldCheck className="w-5 h-5 text-[#00A878]" />
-              <div>
-                <h2 className="text-base font-bold text-[#0F2747]">Step 5 — User CDS Selection (HITL Gate 2)</h2>
-                <p className="text-xs text-[#5F7187]">
-                  Select which CDS views will proceed to field mapping. Each recommendation has completely independent selection state.
-                </p>
-              </div>
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="text-xs bg-[#F4F8FC] border border-[#D9E4F0] text-[#0A6ED1] px-3 py-1 rounded-full font-mono font-bold">
-                Selected: {selectedCandidateIds.length}
-              </span>
-              <span className="text-xs bg-[#E8F8F3] border border-[#00A878]/30 text-[#00A878] px-3 py-1 rounded-full font-medium">
-                User Decision Gate
-              </span>
-            </div>
-          </div>
-
-          {/* Search bar & Selection Counter */}
-          <div className="flex items-center justify-between gap-4">
-            <div className="relative flex-1">
-              <Search className="absolute left-3.5 top-3 w-4 h-4 text-[#5F7187]" />
-              <input
-                type="text"
-                value={selectionSearchQuery}
-                onChange={(e) => setSelectionSearchQuery(e.target.value)}
-                placeholder="Search views to select..."
-                className="w-full rounded-xl bg-white border border-[#D9E4F0] pl-10 pr-4 py-2.5 text-xs text-[#172B4D] placeholder-[#5F7187] outline-none focus:border-[#0A6ED1] focus:ring-1 focus:ring-[#0A6ED1] font-mono"
-              />
-            </div>
-            <div className="px-3.5 py-2.5 rounded-xl bg-[#F4F8FC] border border-[#D9E4F0] text-xs text-[#172B4D] font-mono flex items-center gap-1.5 whitespace-nowrap">
-              <span>Selected:</span>
-              <span className="text-[#0A6ED1] font-bold">{selectedCandidateIds.length}</span>
-            </div>
-          </div>
-
-          {/* Full candidate list with independent selection state */}
-          <div className="space-y-2.5 max-h-[500px] overflow-y-auto pr-1">
-            {allCandidates
-              .filter((c) =>
-                c.cds_name.toLowerCase().includes(selectionSearchQuery.toLowerCase()) ||
-                c.description.toLowerCase().includes(selectionSearchQuery.toLowerCase())
-              )
-              .map((cand) => {
-                const candId = getCandidateId(cand);
-                const isSelected = selectedCandidateIds.includes(candId);
-                return (
-                  <div
-                    key={candId}
-                    onClick={() => toggleCandidateSelection(cand)}
-                    className={`p-4 rounded-xl border cursor-pointer transition flex items-center justify-between ${
-                      isSelected
-                        ? 'border-2 border-[#0A6ED1] bg-[#F4F8FC]'
-                        : 'border-[#D9E4F0] bg-white hover:border-[#0A6ED1]/40'
-                    }`}
-                  >
-                    <div className="flex items-center gap-3">
-                      <input
-                        type="checkbox"
-                        checked={isSelected}
-                        onChange={(e) => {
-                          e.stopPropagation();
-                          toggleCandidateSelection(cand);
-                        }}
-                        className="w-4 h-4 rounded text-[#0A6ED1] focus:ring-0 cursor-pointer"
-                      />
-                      <div>
-                        <div className="flex items-center gap-2">
-                          <span className="font-mono text-xs font-bold text-[#0F2747]">{cand.cds_name}</span>
-                          <span className="font-mono text-[10px] text-[#5F7187] bg-[#F4F8FC] border border-[#D9E4F0] px-1.5 py-0.5 rounded">
-                            {candId}
-                          </span>
-                          <span className="text-[10px] bg-[#F4F8FC] text-[#5F7187] border border-[#D9E4F0] px-1.5 py-0.5 rounded">
-                            {cand.type}
-                          </span>
-                        </div>
-                        <div className="text-[11px] text-[#5F7187] mt-0.5">{cand.description}</div>
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-3">
-                      <span className="text-xs font-mono font-bold text-[#0F2747]">{cand.coverage_pct}%</span>
-                      <span
-                        className={`text-[10px] px-2 py-0.5 rounded font-semibold ${
-                          cand.coverage_pct >= 100
-                            ? 'bg-[#E8F8F3] text-[#00A878] border border-[#00A878]/30'
-                            : cand.coverage_pct >= 70
-                            ? 'bg-[#F4F8FC] text-[#0A6ED1] border border-[#0A6ED1]/30'
-                            : 'bg-amber-50 text-amber-700 border border-amber-200'
-                        }`}
-                      >
-                        {cand.coverage_group}
-                      </span>
-                    </div>
-                  </div>
-                );
-              })}
-          </div>
-
-          <div className="flex items-center justify-between pt-4 border-t border-[#D9E4F0]">
-            <button
-              onClick={() => setActiveStep(3)}
-              className="px-4 py-2 rounded-lg border border-[#D9E4F0] hover:bg-[#F4F8FC] text-xs text-[#0F2747] font-medium flex items-center gap-1.5"
-            >
-              <ArrowLeft className="w-3.5 h-3.5" /> Back to Recommendations
-            </button>
-            <button
-              onClick={handleProceedToMapping}
-              disabled={selectedCandidateIds.length === 0}
-              className="px-6 py-2.5 rounded-xl bg-[#1677FF] hover:bg-[#0A6ED1] disabled:opacity-50 text-white text-xs font-semibold flex items-center gap-2 shadow-xs"
-            >
-              Proceed with {selectedCandidateIds.length} Selected Candidate{selectedCandidateIds.length === 1 ? '' : 's'} <ArrowRight className="w-4 h-4" />
-            </button>
-          </div>
+        <div className="bg-white border border-[#D9E4F0] rounded-2xl p-6 text-center space-y-3">
+          <p className="text-xs text-[#5F7187]">CDS Selection and Join Configuration are now integrated directly into Recommendations &amp; Selection.</p>
+          <button
+            onClick={() => setActiveStep(3)}
+            className="px-4 py-2 bg-[#0A6ED1] text-white text-xs font-semibold rounded-xl"
+          >
+            Go to Recommendations &amp; Selection
+          </button>
         </div>
       )}
 
@@ -3747,17 +4487,26 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
 
           <div className="flex items-center justify-between pt-4 border-t border-[#D9E4F0]">
             <button
-              onClick={() => setActiveStep(4)}
+              onClick={() => setActiveStep(3)}
               className="px-4 py-2 rounded-lg border border-[#D9E4F0] hover:bg-[#F4F8FC] text-xs text-[#0F2747] font-medium flex items-center gap-1.5"
             >
-              <ArrowLeft className="w-3.5 h-3.5" /> Back to Selection
+              <ArrowLeft className="w-3.5 h-3.5" /> Back to Recommendations &amp; Selection
             </button>
-            <button
-              onClick={() => setActiveStep(6)} // Step 7: KPI
-              className="px-6 py-2.5 rounded-xl bg-[#1677FF] hover:bg-[#0A6ED1] text-white text-xs font-semibold flex items-center gap-2 shadow-xs"
-            >
-              Continue to KPI Step <ArrowRight className="w-4 h-4" />
-            </button>
+            {isReuseFlow ? (
+              <button
+                onClick={() => setActiveStep(12)} // Direct completion: Approve Direct CDS Reuse (Zero Clean-Core Footprint)
+                className="px-6 py-2.5 rounded-xl bg-[#00A878] hover:bg-[#00A878]/90 text-white text-xs font-bold flex items-center gap-2 shadow-xs transition"
+              >
+                <CheckCircle2 className="w-4 h-4" /> Approve Direct CDS Reuse (Zero Clean-Core Footprint) →
+              </button>
+            ) : (
+              <button
+                onClick={() => setActiveStep(6)} // Step 7: KPI
+                className="px-6 py-2.5 rounded-xl bg-[#1677FF] hover:bg-[#0A6ED1] text-white text-xs font-semibold flex items-center gap-2 shadow-xs"
+              >
+                Continue to KPI Step <ArrowRight className="w-4 h-4" />
+              </button>
+            )}
           </div>
         </div>
       )}
