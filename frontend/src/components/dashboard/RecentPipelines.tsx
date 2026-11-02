@@ -196,9 +196,11 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
   const [tableLineageResult, setTableLineageResult] = useState<any | null>(null);
   const [tableLineageLoading, setTableLineageLoading] = useState(false);
   const [tableLineageError, setTableLineageError] = useState<string | null>(null);
-  const [selectedLineageCategory, setSelectedLineageCategory] = useState<'ALL' | 'COMBINED' | 'SOURCES' | 'JOINS' | 'ASSOCIATIONS'>('ALL');
-  const [tableExtractionOnly, setTableExtractionOnly] = useState<boolean>(false);
+  const [selectedLineageCategory, setSelectedLineageCategory] = useState<'RECOMMENDED' | 'ALL' | 'COMBINED' | 'SOURCES' | 'JOINS' | 'ASSOCIATIONS'>('RECOMMENDED');
+  const [tableExtractionOnly, setTableExtractionOnly] = useState<boolean>(true);
   const [tableDeltaOnly, setTableDeltaOnly] = useState<boolean>(false);
+  const [tableMatchingMode, setTableMatchingMode] = useState<'ANY' | 'ALL'>('ANY');
+  const [expandedRowCds, setExpandedRowCds] = useState<string | null>(null);
 
   // Step 2: Required Fields + Variants (HITL Gate 1 - Section 6)
   const [requiredFields, setRequiredFields] = useState<ExtractedField[]>([
@@ -490,7 +492,8 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
   const handleSearchTableLineage = async (
     tableNameOverride?: string,
     extractionOverride?: boolean,
-    deltaOverride?: boolean
+    deltaOverride?: boolean,
+    modeOverride?: 'ANY' | 'ALL'
   ) => {
     const target = (tableNameOverride || tableSearchQuery).trim().toUpperCase();
     if (!target) return;
@@ -499,10 +502,11 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
     setTableLineageError(null);
     const isExt = extractionOverride !== undefined ? extractionOverride : tableExtractionOnly;
     const isDelta = deltaOverride !== undefined ? deltaOverride : tableDeltaOnly;
-    console.log(`[SAP Table Lineage] Initiating search for table: '${target}' (extraction_only=${isExt}, delta=${isDelta})`);
+    const mode = modeOverride !== undefined ? modeOverride : tableMatchingMode;
+    console.log(`[SAP Table Lineage] Initiating search for table: '${target}' (mode=${mode}, extraction_only=${isExt}, delta=${isDelta})`);
     try {
-      const data = await fetchTableLineage(target, isExt, isDelta);
-      console.log(`[SAP Table Lineage] Received ${data?.total_matches || 0} matches for table '${target}':`, data);
+      const data = await fetchTableLineage(target, isExt, isDelta, mode);
+      console.log(`[SAP Table Lineage] Received matches for table '${target}':`, data);
       setTableLineageResult(data);
     } catch (err: any) {
       console.error(`[SAP Table Lineage] Error fetching lineage for table '${target}':`, err);
@@ -727,11 +731,13 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
       };
     }
 
-    // Outcome A Check: 100% field coverage + extraction verified enabled in SAP
+    // Outcome A Check: 100% field coverage + extraction verified enabled in SAP (Standard SAP Only)
     const existingExt100 = allCandidates.find(
       (c) => (c.type === 'Single CDS' || !c.cds_name.includes(' + ')) &&
         c.coverage_pct >= 100 &&
-        (c.extraction_status === 'VERIFIED_ENABLED' || c.data_extraction_enabled === true)
+        (c.extraction_status === 'VERIFIED_ENABLED' || c.data_extraction_enabled === true) &&
+        !c.cds_name.toUpperCase().startsWith('Z') &&
+        !c.cds_name.toUpperCase().startsWith('Y')
     );
     if (existingExt100) {
       return {
@@ -741,14 +747,17 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
         cds: existingExt100.cds_name,
         candidate: existingExt100,
         coverage: 100,
-        message: `Existing SAP CDS view '${existingExt100.cds_name}' satisfies 100% of required fields with data extraction enabled. Direct reuse approved without custom wrapper creation.`,
+        message: `Existing Standard SAP CDS view '${existingExt100.cds_name}' satisfies 100% of required fields with data extraction enabled. Direct reuse approved without custom wrapper creation.`,
         requires_create: false,
       };
     }
 
-    // Outcome B: Single CDS covers 100% but extraction is disabled in standard SAP
+    // Outcome B: Single CDS covers 100% but extraction is disabled in standard SAP (Standard SAP Only)
     const single100NonExt = allCandidates.find(
-      (c) => (c.type === 'Single CDS' || !c.cds_name.includes(' + ')) && c.coverage_pct >= 100
+      (c) => (c.type === 'Single CDS' || !c.cds_name.includes(' + ')) &&
+        c.coverage_pct >= 100 &&
+        !c.cds_name.toUpperCase().startsWith('Z') &&
+        !c.cds_name.toUpperCase().startsWith('Y')
     );
     if (single100NonExt) {
       return {
@@ -759,7 +768,7 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
         cds: single100NonExt.cds_name,
         candidate: single100NonExt,
         coverage: 100,
-        message: `Single BASIC CDS view '${single100NonExt.cds_name}' covers 100% of required fields, but data extraction is not enabled in standard SAP. A custom extraction-enabled wrapper view is required.`,
+        message: `Single BASIC Standard CDS view '${single100NonExt.cds_name}' covers 100% of required fields, but data extraction is not enabled in standard SAP. A custom extraction-enabled wrapper view is required.`,
         insufficient_extraction_explanation: `Standard SAP CDS view '${single100NonExt.cds_name}' is not enabled for data extraction in standard SAP (view is not listed in authoritative I_DataExtractionEnabledView catalog). A custom extraction-enabled wrapper view entity is required.`,
         eligible_basic_source_views: [single100NonExt.cds_name],
         missing_fields: [],
@@ -767,9 +776,12 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
       };
     }
 
-    // Outcome B: Multi-CDS combination
+    // Outcome B: Multi-CDS combination (Standard SAP Only)
     const multiCand = allCandidates.find(
-      (c) => (c.type === 'Multi CDS' || c.cds_name.includes(' + ')) && c.coverage_pct > 0
+      (c) => (c.type === 'Multi CDS' || c.cds_name.includes(' + ')) &&
+        c.coverage_pct > 0 &&
+        !c.cds_name.toUpperCase().startsWith('Z') &&
+        !c.cds_name.toUpperCase().startsWith('Y')
     );
     if (multiCand) {
       const viewsList = multiCand.views || multiCand.cds_name.split(' + ');
@@ -1585,6 +1597,9 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
               <span className="text-[10px] bg-blue-100 text-blue-800 font-bold px-2 py-0.5 rounded-md border border-blue-300 flex items-center gap-1 shadow-2xs">
                 BASIC
               </span>
+              <span className="text-[10px] bg-indigo-50 text-indigo-700 font-bold px-2 py-0.5 rounded-md border border-indigo-200 shadow-2xs" title="Genuine Standard SAP CDS View Entity">
+                STANDARD SAP
+              </span>
               <span className="text-[10px] bg-sky-50 text-sky-700 font-mono px-1.5 py-0.5 rounded border border-sky-200">
                 Non-Parameterized
               </span>
@@ -2137,7 +2152,7 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
                 <p className="text-xs text-[#5F7187]">
                   {intakeMode === 'NATURAL_LANGUAGE'
                     ? 'Enter your natural-language business requirement and select applicable SAP functional domains.'
-                    : 'Find standard & custom CDS views that use a transparent SAP table as primary source, join, or association.'}
+                    : 'Find extraction-enabled CDS views that directly use the selected transparent SAP tables.'}
                 </p>
               </div>
             </div>
@@ -2239,29 +2254,70 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
             <div className="space-y-6">
               {/* Search Bar & Quick Pills */}
               <div className="space-y-3">
-                <div className="flex gap-2.5 max-w-2xl">
-                  <div className="relative flex-1">
-                    <Search className="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-[#5F7187]" />
-                    <input
-                      type="text"
-                      value={tableSearchQuery}
-                      onChange={(e) => setTableSearchQuery(e.target.value.toUpperCase())}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter') handleSearchTableLineage();
+                <div className="flex flex-col gap-2.5 max-w-2xl">
+                  {/* Multi-Table Matching Mode Toggle Buttons */}
+                  <div className="flex items-center gap-2">
+                    <span className="text-[11px] font-semibold text-[#5F7187]">Matching Mode:</span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setTableMatchingMode('ANY');
+                        if (tableSearchQuery.trim()) {
+                          handleSearchTableLineage(tableSearchQuery, tableExtractionOnly, tableDeltaOnly, 'ANY');
+                        }
                       }}
-                      placeholder="Enter SAP Table(s), e.g. MARA or ACDOCA, MATDOC or MARA, VBAK..."
-                      className="w-full pl-10 pr-4 py-2.5 bg-[#F4F8FC] border border-[#D9E4F0] rounded-xl text-xs font-mono font-semibold text-[#0F2747] placeholder:text-[#5F7187] focus:outline-none focus:ring-2 focus:ring-[#00A878] focus:bg-white transition"
-                    />
+                      className={`px-3 py-1 rounded-lg text-xs font-bold transition flex items-center gap-1.5 ${
+                        tableMatchingMode === 'ANY'
+                          ? 'bg-[#00A878] text-white shadow-xs'
+                          : 'bg-[#F4F8FC] border border-[#D9E4F0] text-[#5F7187] hover:text-[#0F2747]'
+                      }`}
+                    >
+                      <Sparkles className="w-3.5 h-3.5" />
+                      ANY TABLE (Default)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setTableMatchingMode('ALL');
+                        if (tableSearchQuery.trim()) {
+                          handleSearchTableLineage(tableSearchQuery, tableExtractionOnly, tableDeltaOnly, 'ALL');
+                        }
+                      }}
+                      className={`px-3 py-1 rounded-lg text-xs font-bold transition flex items-center gap-1.5 ${
+                        tableMatchingMode === 'ALL'
+                          ? 'bg-[#00A878] text-white shadow-xs'
+                          : 'bg-[#F4F8FC] border border-[#D9E4F0] text-[#5F7187] hover:text-[#0F2747]'
+                      }`}
+                    >
+                      <Layers className="w-3.5 h-3.5" />
+                      ALL TABLES (Must Cover All)
+                    </button>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => handleSearchTableLineage()}
-                    disabled={tableLineageLoading || !tableSearchQuery.trim()}
-                    className="px-5 py-2.5 bg-[#00A878] hover:bg-[#00A878]/90 disabled:opacity-50 text-white text-xs font-bold rounded-xl flex items-center gap-2 shadow-sm transition"
-                  >
-                    {tableLineageLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
-                    Search Table Lineage
-                  </button>
+
+                  <div className="flex gap-2.5">
+                    <div className="relative flex-1">
+                      <Search className="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-[#5F7187]" />
+                      <input
+                        type="text"
+                        value={tableSearchQuery}
+                        onChange={(e) => setTableSearchQuery(e.target.value.toUpperCase())}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') handleSearchTableLineage();
+                        }}
+                        placeholder="Enter transparent table(s): MARA or MARA, MARC, MARD..."
+                        className="w-full pl-10 pr-4 py-2.5 bg-[#F4F8FC] border border-[#D9E4F0] rounded-xl text-xs font-mono font-semibold text-[#0F2747] placeholder:text-[#5F7187] focus:outline-none focus:ring-2 focus:ring-[#00A878] focus:bg-white transition"
+                      />
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => handleSearchTableLineage()}
+                      disabled={tableLineageLoading || !tableSearchQuery.trim()}
+                      className="px-5 py-2.5 bg-[#00A878] hover:bg-[#00A878]/90 disabled:opacity-50 text-white text-xs font-bold rounded-xl flex items-center gap-2 shadow-sm transition"
+                    >
+                      {tableLineageLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
+                      Discover Lineage
+                    </button>
+                  </div>
                 </div>
 
                 {/* Multi-Table Combos & Quick SAP Tables */}
@@ -2320,7 +2376,7 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
                 <div className="py-12 flex flex-col items-center justify-center gap-3 text-[#5F7187]">
                   <Loader2 className="w-8 h-8 animate-spin text-[#00A878]" />
                   <p className="text-xs font-medium">
-                    Querying SAP metadata catalog &amp; recursive lineage for table(s){' '}
+                    Analyzing direct table references &amp; verifying DDL source for table(s){' '}
                     <span className="font-mono font-bold text-[#0F2747]">{tableSearchQuery}</span>...
                   </p>
                 </div>
@@ -2384,6 +2440,20 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
 
                     {/* Filter Tabs */}
                     <div className="flex flex-wrap items-center gap-1 bg-white border border-[#D9E4F0] rounded-lg p-1 self-start sm:self-auto">
+                      {tableLineageResult.recommendations && (
+                        <button
+                          type="button"
+                          onClick={() => setSelectedLineageCategory('RECOMMENDED')}
+                          className={`px-3 py-1 rounded-md text-[11px] font-semibold transition flex items-center gap-1.5 ${
+                            selectedLineageCategory === 'RECOMMENDED'
+                              ? 'bg-[#00A878] text-white shadow-xs'
+                              : 'text-[#5F7187] hover:text-[#0F2747]'
+                          }`}
+                        >
+                          <Sparkles className="w-3.5 h-3.5 text-amber-300" />
+                          Unique Extraction CDS ({tableLineageResult.recommendations.length})
+                        </button>
+                      )}
                       {tableLineageResult.is_multi_table && (
                         <button
                           type="button"
@@ -2447,49 +2517,294 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
                     </div>
                   </div>
 
-                  {/* Authoritative Extraction Filter Active Banner for Table Lineage */}
-                  {tableLineageResult.extraction_filtering?.filter_active && (
-                    <div className="bg-emerald-50/80 border border-emerald-300 rounded-xl p-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs text-emerald-950 shadow-2xs">
-                      <div className="flex items-start sm:items-center gap-2.5">
-                        <div className="w-7 h-7 rounded-lg bg-emerald-200/80 text-emerald-800 flex items-center justify-center shrink-0">
-                          <CheckCircle className="w-4 h-4" />
-                        </div>
-                        <div>
-                          <div className="flex items-center gap-2">
-                            <span className="font-bold">Authoritative Data Extraction Mode Active</span>
-                            <span className="text-[10px] font-mono bg-white text-emerald-800 px-1.5 py-0.5 rounded border border-emerald-300 font-semibold">
-                              I_DataExtractionEnabledView
+                  {/* Summary Metrics Bar (Section 13) */}
+                  {tableLineageResult.summary_metrics && (
+                    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
+                      {/* Input Tables */}
+                      <div className="bg-white border border-[#D9E4F0] rounded-xl p-3 shadow-2xs">
+                        <div className="text-[10px] uppercase font-bold text-[#5F7187] tracking-wider">Input Tables</div>
+                        <div className="flex flex-wrap items-center gap-1 mt-1.5">
+                          {(tableLineageResult.valid_tables || []).map((tbl: string) => (
+                            <span key={tbl} className="text-[10px] font-mono font-bold bg-emerald-50 text-emerald-700 px-1.5 py-0.5 rounded border border-emerald-300 flex items-center gap-0.5">
+                              <Check className="w-2.5 h-2.5 text-emerald-600" /> {tbl}
                             </span>
-                            {tableLineageResult.extraction_filtering.require_delta_support && (
-                              <span className="text-[10px] font-mono bg-purple-100 text-purple-800 px-1.5 py-0.5 rounded border border-purple-300 font-bold">
-                                Delta CDC Required
-                              </span>
-                            )}
-                          </div>
-                          <p className="text-[11px] text-emerald-800/90 mt-0.5">
-                            Table lineage views are strictly filtered to CDS views confirmed data extraction enabled in SAP metadata. Non-extraction views were pruned.
-                          </p>
+                          ))}
+                          {(tableLineageResult.invalid_tables || []).map((inv: any) => (
+                            <span key={inv.table_name} className="text-[10px] font-mono font-bold bg-red-50 text-red-700 px-1.5 py-0.5 rounded border border-red-300 flex items-center gap-0.5" title={inv.reason}>
+                              <X className="w-2.5 h-2.5 text-red-600" /> {inv.table_name}
+                            </span>
+                          ))}
                         </div>
                       </div>
-                      <div className="flex items-center gap-2 text-[11px] font-mono text-emerald-900 shrink-0">
-                        {tableLineageResult.extraction_filtering.excluded_total_count > 0 && (
-                          <span className="bg-white px-2.5 py-1 rounded-md border border-emerald-200 font-semibold shadow-2xs">
-                            Pruned: {tableLineageResult.extraction_filtering.excluded_total_count} views
-                          </span>
-                        )}
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setTableExtractionOnly(false);
-                            setTableDeltaOnly(false);
-                            handleSearchTableLineage(tableSearchQuery, false, false);
-                          }}
-                          className="px-2.5 py-1 rounded-md bg-white border border-emerald-300 hover:bg-emerald-100 text-emerald-800 font-bold transition flex items-center gap-1 shadow-2xs"
-                          title="Remove extraction filter and view all standard CDS lineage views"
-                        >
-                          <RefreshCw className="w-3 h-3" /> Turn Off Filter
-                        </button>
+
+                      {/* Candidates Discovered */}
+                      <div className="bg-white border border-[#D9E4F0] rounded-xl p-3 shadow-2xs">
+                        <div className="text-[10px] uppercase font-bold text-[#5F7187] tracking-wider">Discovered</div>
+                        <div className="text-base font-mono font-bold text-[#0F2747] mt-1">
+                          {tableLineageResult.summary_metrics.total_discovered_candidates?.toLocaleString() || 0}
+                        </div>
+                        <div className="text-[10px] text-[#5F7187]">Total Lineage Candidates</div>
                       </div>
+
+                      {/* Unique Extraction Recommended */}
+                      <div className="bg-white border border-emerald-300 rounded-xl p-3 shadow-2xs bg-emerald-50/20">
+                        <div className="text-[10px] uppercase font-bold text-emerald-800 tracking-wider">Recommended</div>
+                        <div className="text-base font-mono font-bold text-emerald-700 mt-1 flex items-center gap-1">
+                          <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                          {tableLineageResult.summary_metrics.unique_extraction_recommended?.toLocaleString() || 0}
+                        </div>
+                        <div className="text-[10px] text-emerald-700">Unique Extraction CDS</div>
+                      </div>
+
+                      {/* Duplicates Filtered */}
+                      <div className="bg-white border border-[#D9E4F0] rounded-xl p-3 shadow-2xs">
+                        <div className="text-[10px] uppercase font-bold text-[#5F7187] tracking-wider">Deduplicated</div>
+                        <div className="text-base font-mono font-bold text-indigo-700 mt-1">
+                          {tableLineageResult.summary_metrics.duplicates_removed?.toLocaleString() || 0}
+                        </div>
+                        <div className="text-[10px] text-[#5F7187]">Multi-path duplicates removed</div>
+                      </div>
+
+                      {/* Unverified Excluded */}
+                      <div className="bg-white border border-[#D9E4F0] rounded-xl p-3 shadow-2xs">
+                        <div className="text-[10px] uppercase font-bold text-[#5F7187] tracking-wider">Pruned</div>
+                        <div className="text-base font-mono font-bold text-amber-700 mt-1">
+                          {tableLineageResult.summary_metrics.unverified_excluded?.toLocaleString() || 0}
+                        </div>
+                        <div className="text-[10px] text-[#5F7187]">Non-extraction pruned</div>
+                      </div>
+
+                      {/* Execution Speed */}
+                      <div className="bg-white border border-[#D9E4F0] rounded-xl p-3 shadow-2xs">
+                        <div className="text-[10px] uppercase font-bold text-[#5F7187] tracking-wider">Speed</div>
+                        <div className="text-base font-mono font-bold text-[#0A6ED1] mt-1">
+                          {tableLineageResult.summary_metrics.execution_time_ms}ms
+                        </div>
+                        <div className="text-[10px] text-[#5F7187]">Direct Table Index</div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* PRIMARY UNIQUE EXTRACTION-ENABLED RECOMMENDATIONS TABLE */}
+                  {selectedLineageCategory === 'RECOMMENDED' && (
+                    <div className="space-y-3">
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-[#00A878]/30 pb-2">
+                        <div className="flex items-center gap-2">
+                          <Sparkles className="w-4 h-4 text-[#00A878]" />
+                          <h3 className="text-xs font-bold text-[#0F2747] uppercase tracking-wider">
+                            Standard SAP Extraction-Enabled CDS Recommendations (Strict Unique Filter)
+                          </h3>
+                          <span className="text-[10px] bg-emerald-100 text-emerald-800 font-bold px-2 py-0.5 rounded-full border border-emerald-300">
+                            {tableLineageResult.recommendations?.length || 0} unique views
+                          </span>
+                          <span className="text-[10px] bg-indigo-50 text-indigo-700 font-bold px-2 py-0.5 rounded-full border border-indigo-200">
+                            Standard SAP Only
+                          </span>
+                        </div>
+                        <span className="text-[11px] text-[#5F7187]">
+                          Mode: <strong className="text-[#0F2747]">{tableLineageResult.matching_mode || tableMatchingMode}</strong> | Exactly 1 row per unique CDS DDL Name
+                        </span>
+                      </div>
+
+                      {(!tableLineageResult.recommendations || tableLineageResult.recommendations.length === 0) ? (
+                        <div className="p-6 bg-amber-50 rounded-xl border border-amber-200 text-center text-xs text-amber-800 font-medium">
+                          No extraction-enabled CDS views directly reference the selected transparent database tables.
+                        </div>
+                      ) : (
+                        <div className="overflow-x-auto border border-[#D9E4F0] rounded-xl shadow-2xs bg-white">
+                          <table className="w-full text-left border-collapse text-xs">
+                            <thead>
+                              <tr className="bg-[#F4F8FC] border-b border-[#D9E4F0] text-[11px] font-bold text-[#5F7187] uppercase tracking-wider">
+                                <th className="py-2.5 px-3">CDS DDL Name & Classification</th>
+                                <th className="py-2.5 px-3">SQL View Name</th>
+                                <th className="py-2.5 px-3">Direct Sources (FROM & JOIN)</th>
+                                <th className="py-2.5 px-3">Matched Database Table</th>
+                                <th className="py-2.5 px-3">Extraction Annotation</th>
+                                <th className="py-2.5 px-3">CDC Status</th>
+                                <th className="py-2.5 px-3">DDL Verification</th>
+                                <th className="py-2.5 px-3 text-right">Actions</th>
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-[#D9E4F0]">
+                              {tableLineageResult.recommendations.map((rec: any) => {
+                                const isExpanded = expandedRowCds === rec.cds_name;
+                                const joinList = rec.direct_join_sources && rec.direct_join_sources.length > 0 ? rec.direct_join_sources : [];
+                                return (
+                                  <React.Fragment key={rec.cds_name}>
+                                    <tr className="hover:bg-blue-50/30 transition">
+                                      <td className="py-3 px-3">
+                                        <div className="flex items-center gap-1.5">
+                                          <button
+                                            type="button"
+                                            onClick={() => setExpandedRowCds(isExpanded ? null : rec.cds_name)}
+                                            className="p-0.5 text-[#5F7187] hover:text-[#0F2747] transition"
+                                            title="Expand/Collapse direct table evidence drawer"
+                                          >
+                                            {isExpanded ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                                          </button>
+                                          <div>
+                                            <div className="font-mono font-bold text-xs text-[#0A6ED1] flex items-center gap-1.5 flex-wrap">
+                                              <span>{rec.cds_name}</span>
+                                              <span className="text-[9px] bg-emerald-100 text-emerald-800 font-bold px-1.5 py-0.5 rounded border border-emerald-300 shadow-2xs" title="Strict direct transparent database table dependency">
+                                                DIRECT_TABLE_SOURCE
+                                              </span>
+                                              <span className="text-[9px] bg-indigo-50 text-indigo-700 font-bold px-1.5 py-0.5 rounded border border-indigo-200 shadow-2xs">
+                                                {rec.is_standard ? 'STANDARD SAP' : 'CUSTOM Z/Y'}
+                                              </span>
+                                            </div>
+                                            <div className="text-[11px] text-[#5F7187] truncate max-w-xs">{rec.label}</div>
+                                          </div>
+                                        </div>
+                                      </td>
+                                      <td className="py-3 px-3">
+                                        <span className="font-mono text-[11px] text-[#0F2747] font-semibold">
+                                          {rec.sql_view_name || 'None (View Entity)'}
+                                        </span>
+                                      </td>
+                                      <td className="py-3 px-3">
+                                        <div className="flex flex-col gap-1">
+                                          <span className="font-mono text-[11px] font-bold text-emerald-800 bg-emerald-50 px-1.5 py-0.5 rounded border border-emerald-200 w-fit" title="Direct FROM clause in DDL">
+                                            as select from {rec.direct_from_source || 'None'}
+                                          </span>
+                                          {joinList.length > 0 && (
+                                            <span className="font-mono text-[10px] font-semibold text-amber-800 bg-amber-50 px-1.5 py-0.5 rounded border border-amber-200 w-fit" title="Direct JOIN clause(s) in DDL">
+                                              join {joinList.join(', ')}
+                                            </span>
+                                          )}
+                                        </div>
+                                      </td>
+                                      <td className="py-3 px-3">
+                                        <span className="font-mono text-[11px] font-bold bg-gray-100 text-[#0F2747] px-2 py-0.5 rounded border border-gray-300">
+                                          {rec.matched_input_tables?.join(', ') || rec.requested_table}
+                                        </span>
+                                      </td>
+                                      <td className="py-3 px-3">
+                                        <div className="flex flex-col gap-0.5">
+                                          <span className="inline-flex items-center gap-1 text-[10px] font-bold bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded-full border border-emerald-300 shadow-2xs w-fit">
+                                            <CheckCircle className="w-3 h-3 text-emerald-600" />
+                                            EXTRACTION_ENABLED
+                                          </span>
+                                          <span className="text-[9px] text-[#5F7187] font-mono truncate max-w-[140px]" title={rec.verification_evidence}>
+                                            {rec.verification_evidence}
+                                          </span>
+                                        </div>
+                                      </td>
+                                      <td className="py-3 px-3">
+                                        <div className="flex flex-col gap-0.5">
+                                          {rec.cdc_status === 'CDC_SUPPORTED' ? (
+                                            <span className="inline-flex items-center gap-1 text-[10px] font-bold bg-purple-100 text-purple-800 px-2 py-0.5 rounded-full border border-purple-300 shadow-2xs w-fit">
+                                              <Zap className="w-3 h-3 text-purple-600" />
+                                              CDC_SUPPORTED
+                                            </span>
+                                          ) : (
+                                            <span className="inline-flex items-center gap-1 text-[10px] text-[#5F7187] bg-gray-100 px-2 py-0.5 rounded-full border border-gray-200 w-fit">
+                                              CDC_NOT_SUPPORTED
+                                            </span>
+                                          )}
+                                          <span className="text-[9px] text-[#5F7187] font-mono truncate max-w-[140px]" title={rec.cdc_evidence}>
+                                            {rec.cdc_evidence}
+                                          </span>
+                                        </div>
+                                      </td>
+                                      <td className="py-3 px-3">
+                                        <span className="inline-flex items-center gap-1 text-[10px] font-bold bg-blue-50 text-[#0A6ED1] px-2 py-0.5 rounded-full border border-blue-200 shadow-2xs">
+                                          <CheckCircle className="w-3 h-3 text-[#0A6ED1]" />
+                                          {rec.source_verification_status || 'VERIFIED_FROM_DDL_SOURCE'}
+                                        </span>
+                                      </td>
+                                      <td className="py-3 px-3 text-right">
+                                        <div className="flex items-center justify-end gap-1.5">
+                                          <button
+                                            type="button"
+                                            onClick={() => handleOpenLiveSource(rec.cds_name)}
+                                            className="px-2.5 py-1 rounded bg-white hover:bg-purple-50 text-[#0A6ED1] font-mono text-[11px] border border-[#D9E4F0] transition flex items-center gap-1 shadow-2xs"
+                                            title="View live DDL source from SAP ADT"
+                                          >
+                                            <Code2 className="w-3 h-3 text-[#0A6ED1]" /> DDL
+                                          </button>
+                                          <button
+                                            type="button"
+                                            onClick={() => handleUseLineageViewInRequirement(rec.cds_name, rec.label, (rec.related_input_tables || []).join(', '))}
+                                            className="px-2.5 py-1 rounded bg-[#00A878] hover:bg-[#00A878]/90 text-white text-[11px] font-semibold transition flex items-center gap-1 shadow-xs"
+                                            title="Use this CDS view in requirement pipeline"
+                                          >
+                                            <Sparkles className="w-3 h-3" /> Use
+                                          </button>
+                                        </div>
+                                      </td>
+                                    </tr>
+
+                                    {/* Expandable Row Drawer */}
+                                    {isExpanded && (
+                                      <tr className="bg-[#F8FAFC]">
+                                        <td colSpan={8} className="p-4 border-b border-[#D9E4F0]">
+                                          <div className="space-y-3">
+                                            {/* Summary Box */}
+                                            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 p-3 rounded-lg bg-white border border-[#D9E4F0] shadow-2xs text-xs">
+                                              <div>
+                                                <span className="text-[10px] uppercase font-bold text-[#5F7187] block">Direct FROM Source:</span>
+                                                <span className="font-mono font-bold text-emerald-800 text-[11px]">
+                                                  {rec.direct_from_source || 'None'}
+                                                </span>
+                                              </div>
+                                              <div>
+                                                <span className="text-[10px] uppercase font-bold text-[#5F7187] block">Direct JOIN Sources:</span>
+                                                <span className="font-mono font-bold text-amber-800 text-[11px]">
+                                                  {joinList.length > 0 ? joinList.join(', ') : 'None'}
+                                                </span>
+                                              </div>
+                                              <div>
+                                                <span className="text-[10px] uppercase font-bold text-[#5F7187] block">Matched Database Table:</span>
+                                                <span className="font-mono font-bold text-[#0F2747] text-[11px]">
+                                                  {rec.matched_input_tables?.join(', ') || rec.requested_table}
+                                                </span>
+                                              </div>
+                                              <div>
+                                                <span className="text-[10px] uppercase font-bold text-[#5F7187] block">Dependency Classification:</span>
+                                                <span className="font-mono font-bold text-emerald-700 text-[11px]">
+                                                  DIRECT_TABLE_SOURCE
+                                                </span>
+                                              </div>
+                                            </div>
+
+                                            {/* Metadata & Evidence */}
+                                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 p-3 rounded-lg bg-white border border-[#D9E4F0] shadow-2xs text-xs">
+                                              <div>
+                                                <span className="text-[10px] uppercase font-bold text-[#5F7187] block">SQL View Name:</span>
+                                                <span className="font-mono font-bold text-[#0F2747] text-[11px]">
+                                                  {rec.sql_view_name || 'None (View Entity)'}
+                                                </span>
+                                              </div>
+                                              <div>
+                                                <span className="text-[10px] uppercase font-bold text-[#5F7187] block">Package / Domain:</span>
+                                                <span className="font-mono text-[#0F2747] text-[11px]">
+                                                  {rec.package || 'SAP_STANDARD'} | {rec.domain || 'Core'}
+                                                </span>
+                                              </div>
+                                            </div>
+
+                                            {/* Verification Evidence & CDC details */}
+                                            <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5 pt-1 text-xs">
+                                              <div className="p-2.5 rounded-lg bg-emerald-50/60 border border-emerald-200">
+                                                <span className="font-bold text-emerald-900 block mb-0.5">Data Extraction Verification Evidence:</span>
+                                                <span className="text-emerald-800 text-[11px] font-mono">{rec.verification_evidence}</span>
+                                              </div>
+                                              <div className="p-2.5 rounded-lg bg-purple-50/60 border border-purple-200">
+                                                <span className="font-bold text-purple-900 block mb-0.5">Change Data Capture (CDC) Mapping Evidence:</span>
+                                                <span className="text-purple-800 text-[11px] font-mono">{rec.cdc_evidence}</span>
+                                              </div>
+                                            </div>
+                                          </div>
+                                        </td>
+                                      </tr>
+                                    )}
+                                  </React.Fragment>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
                     </div>
                   )}
 

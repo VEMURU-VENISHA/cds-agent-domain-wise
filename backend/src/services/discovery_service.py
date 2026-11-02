@@ -53,6 +53,27 @@ class CDSDiscoveryService:
         self._extraction_metadata_cache: Optional[Dict[str, Any]] = None
         self._extraction_cache_timestamp: float = 0.0
 
+    @staticmethod
+    def is_standard_cds(cds_name: str, package: Optional[str] = None) -> bool:
+        """Determines if a CDS view is a genuine standard SAP-delivered view.
+
+        Rules:
+        - In SAP ABAP and S/4HANA, custom / customer-defined objects reside in the Z* or Y* namespace.
+        - Any view beginning with 'Z' or 'Y' (or customer namespace '/Z', '/Y') is custom.
+        - Standard SAP CDS views are delivered under SAP standard namespaces (e.g. 'I_', 'C_', 'R_', 'E_', 'P_')
+          and belong to SAP standard packages (never starting with 'Z', 'Y', or '$TMP').
+        """
+        if not cds_name:
+            return False
+        name_up = cds_name.strip().upper()
+        if name_up.startswith(("Z", "Y", "/Z", "/Y")):
+            return False
+        if package:
+            pkg_up = package.strip().upper()
+            if pkg_up.startswith(("Z", "Y", "$TMP", "/Z", "/Y")):
+                return False
+        return True
+
     def _get_db(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path))
         conn.row_factory = sqlite3.Row
@@ -1930,6 +1951,7 @@ class CDSDiscoveryService:
         extraction_enabled_only: Optional[bool] = None,
         require_delta_support: Optional[bool] = None,
         sap_client: Optional[Any] = None,
+        standard_only: bool = True,
     ) -> Dict[str, Any]:
         """Executes complete, two-stage un-truncated CDS discovery and validation.
         
@@ -2006,6 +2028,7 @@ class CDSDiscoveryService:
             "domains": sorted(selected_domains or []),
             "extraction_enabled": filter_extraction,
             "delta_support": filter_delta,
+            "standard_only": standard_only,
         }
         cache_key = hashlib.sha256(json.dumps(cache_key_data, sort_keys=True).encode("utf-8")).hexdigest()
         if use_cache and cache_key in self._search_cache:
@@ -2192,6 +2215,9 @@ class CDSDiscoveryService:
                 if v["fields"] and v_up not in seen_single_names:
                     pkg = v.get("package") or "SAP_STANDARD"
                     app_comp = v.get("application_component") or ""
+                    # Enforce standard SAP CDS filtering (exclude custom Z*/Y* views and customer packages)
+                    if standard_only and not self.is_standard_cds(v["cds_name"], package=pkg):
+                        continue
                     raw_dom = v.get("domain") or resolve_domain_from_sap_metadata(package=pkg, application_component=app_comp)
                     # When domain filtering is requested, views from unselected domains are excluded
                     if selected_domains and not self._check_domain_affinity(raw_dom, app_comp, selected_domains):
@@ -2313,6 +2339,8 @@ class CDSDiscoveryService:
                     "domain_verified": is_dom_verified,
                     "domain_unverified_reason": dom_unverified_reason,
                     "domain_match": domain_match,
+                    "is_standard": True,
+                    "sap_origin": "SAP_STANDARD",
                     "classification": "BASIC",
                     "classification_evidence": "Verified @VDM.viewType: #BASIC in authentic SAP DDL source; no 'with parameters' clause",
                     "is_basic": True,
@@ -2417,6 +2445,13 @@ class CDSDiscoveryService:
                         if not nbr_view or not nbr_view.get("fields"):
                             rejected_paths_count += 1
                             rejected_reasons["neighbor_has_no_indexed_fields"] += 1
+                            continue
+
+                        # Standard SAP CDS view enforcement
+                        if standard_only and not self.is_standard_cds(nbr_up, nbr_view.get("package")):
+                            rejected_paths_count += 1
+                            rejected_reasons.setdefault("neighbor_not_standard_sap", 0)
+                            rejected_reasons["neighbor_not_standard_sap"] += 1
                             continue
 
                         # When domain filtering is active, neighbors must also belong to selected domains
@@ -2549,12 +2584,14 @@ class CDSDiscoveryService:
         # - If delta required: DeltaChgDataCaptureIsSupported must be True
         # - Covers 100% of required fields
         # - Source DDL retrievable
+        # - Genuine SAP Standard CDS view (never custom Z*/Y*)
         ext_first_candidates = [
             c for c in single_cds_results
             if c.get("coverage_pct", 0) >= 100.0
             and c.get("extraction_status") == "VERIFIED_ENABLED"
             and (not filter_delta or c.get("delta_cdc_supported"))
             and c.get("ddl_available")
+            and (not standard_only or self.is_standard_cds(c["cds_name"], c.get("package")))
         ]
 
         if ext_first_candidates:
@@ -2595,8 +2632,17 @@ class CDSDiscoveryService:
         else:
             # Stage 2: Fallback Search and Wrapper Source Discovery (Outcome B: Custom Wrapper Required)
             # A BASIC CDS view with extraction disabled CAN be selected as a source dependency for a custom extraction-enabled wrapper.
-            single_100 = [c for c in single_cds_results if c.get("coverage_pct", 0) >= 100.0]
-            multi_100 = [c for c in multi_cds_candidates if c.get("coverage_pct", 0) >= 100.0]
+            # When standard_only is enabled, source dependencies must be genuine Standard SAP CDS views.
+            single_100 = [
+                c for c in single_cds_results 
+                if c.get("coverage_pct", 0) >= 100.0
+                and (not standard_only or self.is_standard_cds(c["cds_name"], c.get("package")))
+            ]
+            multi_100 = [
+                c for c in multi_cds_candidates 
+                if c.get("coverage_pct", 0) >= 100.0
+                and (not standard_only or all(self.is_standard_cds(v) for v in c.get("views", [])))
+            ]
             best_multi = multi_100[0] if multi_100 else (multi_cds_candidates[0] if multi_cds_candidates else None)
 
             eligible_sources = []
@@ -2719,6 +2765,8 @@ class CDSDiscoveryService:
             "candidates": all_candidates,
             "single_cds_candidates": single_cds_results,
             "multi_cds_candidates": multi_cds_candidates,
+            "standard_only": standard_only,
+            "standard_views_enforced": True,
             "cached_timestamp": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
         }
 

@@ -103,7 +103,8 @@ export async function runDiscovery(
   useCache: boolean = true,
   selectedDomains?: string[],
   extractionEnabledOnly?: boolean,
-  requireDeltaSupport?: boolean
+  requireDeltaSupport?: boolean,
+  standardOnly: boolean = true
 ) {
   const res = await fetch(`${API_BASE}/discovery/run`, {
     method: 'POST',
@@ -116,6 +117,7 @@ export async function runDiscovery(
       selected_domains: selectedDomains,
       extraction_enabled_only: extractionEnabledOnly,
       require_delta_support: requireDeltaSupport,
+      standard_only: standardOnly,
     }),
   });
   if (!res.ok) {
@@ -321,11 +323,13 @@ export async function runIncrementalSync(prefixes?: string[], maxPerPrefix: numb
 
 export async function fetchTableLineage(
   tableName: string,
-  extractionEnabledOnly: boolean = false,
-  requireDeltaSupport: boolean = false
+  extractionEnabledOnly: boolean = true,
+  requireDeltaSupport: boolean = false,
+  matchingMode: 'ANY' | 'ALL' = 'ANY',
+  standardOnly: boolean = true
 ) {
   const clean = tableName.trim();
-  const query = `?tables=${encodeURIComponent(clean)}&extraction_enabled_only=${extractionEnabledOnly}&require_delta_support=${requireDeltaSupport}`;
+  const query = `?tables=${encodeURIComponent(clean)}&matching_mode=${matchingMode}&extraction_enabled_only=${extractionEnabledOnly}&require_delta_support=${requireDeltaSupport}&standard_only=${standardOnly}`;
   const res = await fetch(`${API_BASE}/discovery/table-lineage${query}`);
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));

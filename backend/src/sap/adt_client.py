@@ -9,11 +9,16 @@ Enterprise Safety & Hygiene:
 - Explicit typed error mapping for HTTP status codes (401, 403, 404, 500+).
 """
 
+import asyncio
 import hashlib
 import re
 from typing import Any, Dict, List, Optional, Union
 import xml.etree.ElementTree as ET
 import httpx
+try:
+    import httpcore
+except ImportError:
+    httpcore = None
 from src.config import Settings, get_settings
 from src.core.exceptions import (
     SAPAuthenticationError,
@@ -37,6 +42,7 @@ class SAPADTClient:
         self.settings = settings or get_settings()
         self._custom_client = client
         self._session: Optional[httpx.AsyncClient] = None
+        self._lock: Optional[asyncio.Lock] = None
         self._csrf_token: Optional[str] = None
         self._is_stateful: bool = False
         self._package_cache: Dict[str, Dict[str, Any]] = {}
@@ -341,38 +347,142 @@ class SAPADTClient:
                 self.settings.SAP_SYSTEM_ID,
             )
 
+    def _get_lock(self) -> asyncio.Lock:
+        """Returns or initializes the asyncio.Lock bound to the current event loop."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    async def _reset_session(self) -> None:
+        """Safely tears down and clears the connection pool after a socket drop."""
+        lock = self._get_lock()
+        async with lock:
+            if self._session is not None:
+                try:
+                    if not self._session.is_closed:
+                        await self._session.aclose()
+                except Exception as close_err:
+                    logger.debug("Error while closing stale session: %s", close_err)
+                finally:
+                    self._session = None
+
     async def _get_client(self) -> httpx.AsyncClient:
         """Creates or returns an active persistent httpx client with configured SSL, redirect, and timeout settings.
 
         Reusing the same client ensures SAP session cookies (e.g. SAP_SESSIONID_*, sap-usercontext)
         are preserved between the CSRF-fetch GET and the checkrun POST.
+        Task-safe and thread-safe via asyncio.Lock. Explicitly enforces HTTP/1.1 for SAP ICF compatibility.
         """
         if self._custom_client is not None:
             return self._custom_client
 
-        if self._session is None or self._session.is_closed:
-            base_url = self.settings.SAP_BASE_URL.rstrip("/")
-            verify_ssl: Union[bool, str] = self.settings.SAP_VERIFY_SSL
-            if self.settings.SAP_CA_BUNDLE_PATH and self.settings.SAP_CA_BUNDLE_PATH.strip():
-                verify_ssl = self.settings.SAP_CA_BUNDLE_PATH.strip()
+        lock = self._get_lock()
+        async with lock:
+            if self._session is None or self._session.is_closed:
+                base_url = self.settings.SAP_BASE_URL.rstrip("/")
+                verify_ssl: Union[bool, str] = self.settings.SAP_VERIFY_SSL
+                if self.settings.SAP_CA_BUNDLE_PATH and self.settings.SAP_CA_BUNDLE_PATH.strip():
+                    verify_ssl = self.settings.SAP_CA_BUNDLE_PATH.strip()
 
-            self._session = httpx.AsyncClient(
-                base_url=base_url,
-                verify=verify_ssl,
-                follow_redirects=False,
-                timeout=float(self.settings.SAP_REQUEST_TIMEOUT_SECONDS),
-                auth=self._get_auth_tuple(),
-            )
+                timeout_sec = float(self.settings.SAP_REQUEST_TIMEOUT_SECONDS)
+                timeout = httpx.Timeout(
+                    timeout_sec,
+                    connect=10.0,
+                    read=timeout_sec,
+                    write=timeout_sec,
+                    pool=10.0,
+                )
+                limits = httpx.Limits(
+                    max_connections=30,
+                    max_keepalive_connections=15,
+                    keepalive_expiry=15.0,
+                )
 
-        return self._session
+                self._session = httpx.AsyncClient(
+                    base_url=base_url,
+                    verify=verify_ssl,
+                    http2=False,  # Strictly HTTP/1.1: SAP NetWeaver ICF does not support HTTP/2 multiplexing
+                    follow_redirects=False,
+                    timeout=timeout,
+                    limits=limits,
+                    auth=self._get_auth_tuple(),
+                )
+
+            return self._session
+
+    TRANSIENT_CONNECTION_ERRORS = (
+        httpx.RemoteProtocolError,
+        httpx.ConnectError,
+        httpx.ReadError,
+        ConnectionResetError,
+        ConnectionError,
+    )
+    if httpcore is not None:
+        TRANSIENT_CONNECTION_ERRORS = (
+            httpx.RemoteProtocolError,
+            httpx.ConnectError,
+            httpx.ReadError,
+            ConnectionResetError,
+            ConnectionError,
+            httpcore.RemoteProtocolError,
+            httpcore.ConnectError,
+            httpcore.ReadError,
+        )
+
+    async def _send_request(
+        self,
+        method: str,
+        path: str,
+        max_retries: int = 1,
+        **kwargs,
+    ) -> httpx.Response:
+        """Executes an HTTP request with bounded retry on transient keepalive socket drops.
+        
+        Guarantees that response bodies are fully consumed (resp.aread()) to return connections
+        cleanly to the pool without corrupting or stranding socket streams.
+        """
+        attempts = 0
+        while True:
+            attempts += 1
+            client = await self._get_client()
+            try:
+                resp = await client.request(method, path, **kwargs)
+                await resp.aread()  # Fully consume response stream
+                return resp
+            except self.TRANSIENT_CONNECTION_ERRORS as e:
+                clean_path = self._sanitize_url_for_logging(path)
+                if attempts <= max_retries:
+                    logger.warning(
+                        "Transient SAP ADT connection error on %s %s (%s: %s). "
+                        "Re-establishing fresh connection and retrying (attempt %d/%d)...",
+                        method,
+                        clean_path,
+                        type(e).__name__,
+                        e,
+                        attempts,
+                        max_retries,
+                    )
+                    await self._reset_session()
+                    await asyncio.sleep(0.3)
+                    continue
+                logger.error(
+                    "SAP ADT connection failed on %s %s after %d attempts: %s",
+                    method,
+                    clean_path,
+                    attempts,
+                    e,
+                )
+                raise SAPConnectionError(f"Connection to SAP failed on {path}: {e}") from e
 
     async def aclose(self) -> None:
         """Closes the underlying persistent HTTP session to avoid connection leaks."""
-        if self._session is not None and not self._session.is_closed:
-            await self._session.aclose()
-            self._session = None
-        self._csrf_token = None
-        self._is_stateful = False
+        lock = self._get_lock()
+        async with lock:
+            if self._session is not None and not self._session.is_closed:
+                await self._session.aclose()
+                self._session = None
+            self._csrf_token = None
+            self._is_stateful = False
 
     async def __aenter__(self) -> "SAPADTClient":
         return self
@@ -424,8 +534,7 @@ class SAPADTClient:
         self._log_request("GET", path)
 
         try:
-            client = await self._get_client()
-            resp = await client.get(path, params=params, headers=headers)
+            resp = await self._send_request("GET", path, params=params, headers=headers)
             self._log_request("GET", path, resp.status_code)
 
             token = resp.headers.get("x-csrf-token")
@@ -460,8 +569,7 @@ class SAPADTClient:
         self._log_request("GET", path)
 
         try:
-            client = await self._get_client()
-            resp = await client.get(path, params=params, headers=headers)
+            resp = await self._send_request("GET", path, params=params, headers=headers)
 
             self._log_request("GET", path, resp.status_code)
 
@@ -477,7 +585,7 @@ class SAPADTClient:
                     source_headers = dict(headers)
                     source_headers["Accept"] = "text/plain, */*"
                     self._log_request("GET", source_path)
-                    source_resp = await client.get(source_path, params=params, headers=source_headers)
+                    source_resp = await self._send_request("GET", source_path, params=params, headers=source_headers)
                     self._log_request("GET", source_path, source_resp.status_code)
                     if source_resp.status_code in (200, 304):
                         return source_resp.text
@@ -524,8 +632,7 @@ class SAPADTClient:
         headers["Accept"] = "text/plain, */*"
 
         try:
-            client = await self._get_client()
-            resp = await client.get(subresource_path, params=params, headers=headers)
+            resp = await self._send_request("GET", subresource_path, params=params, headers=headers)
             etag = resp.headers.get("ETag") or resp.headers.get("etag")
             etag_clean = etag.strip() if (etag and etag.strip()) else "none"
             logger.info("[ADT RESOURCE] GET /source/main status=%d ETag=%s", resp.status_code, etag_clean)
@@ -573,8 +680,7 @@ class SAPADTClient:
         )
 
         try:
-            client = await self._get_client()
-            resp = await client.get(path, params=params, headers=headers)
+            resp = await self._send_request("GET", path, params=params, headers=headers)
 
             self._log_request("GET", path, resp.status_code)
             if resp.status_code in (200, 304):
@@ -678,8 +784,7 @@ class SAPADTClient:
         self._log_request("GET", path)
 
         try:
-            client = await self._get_client()
-            resp = await client.get(path, params=params, headers=headers)
+            resp = await self._send_request("GET", path, params=params, headers=headers)
 
             self._log_request("GET", path, resp.status_code)
 
@@ -735,8 +840,7 @@ class SAPADTClient:
         headers["Accept"] = "application/xml, text/xml, */*"
 
         try:
-            client = await self._get_client()
-            resp = await client.get(path, headers=headers)
+            resp = await self._send_request("GET", path, headers=headers)
             if resp.status_code == 200:
                 import xml.etree.ElementTree as ET
                 root = ET.fromstring(resp.text)
@@ -1481,8 +1585,7 @@ class SAPADTClient:
 
         self._log_request("GET", path)
         try:
-            client = await self._get_client()
-            resp = await client.get(path, params=params, headers=headers)
+            resp = await self._send_request("GET", path, params=params, headers=headers)
             self._log_request("GET", path, resp.status_code)
 
             if resp.status_code in (200, 204):
@@ -1670,8 +1773,7 @@ class SAPADTClient:
         headers["Accept"] = "application/xml, text/plain, */*"
         headers["X-CSRF-Token"] = csrf_token
 
-        client = await self._get_client()
-        resp = await client.post(path, headers=headers, content=query)
+        resp = await self._send_request("POST", path, headers=headers, content=query)
         if resp.status_code == 200:
             import xml.etree.ElementTree as ET
             root = ET.fromstring(resp.text)
@@ -1770,8 +1872,7 @@ class SAPADTClient:
             headers["Accept"] = "application/xml, text/plain, */*"
             headers["X-CSRF-Token"] = csrf_token
 
-            client = await self._get_client()
-            resp = await client.post(path, headers=headers, content=query)
+            resp = await self._send_request("POST", path, headers=headers, content=query)
 
             if resp.status_code == 200:
                 import xml.etree.ElementTree as ET
@@ -1881,8 +1982,7 @@ class SAPADTClient:
         headers["Accept"] = "application/xml, text/xml, */*"
 
         try:
-            client = await self._get_client()
-            resp = await client.get(path, headers=headers)
+            resp = await self._send_request("GET", path, headers=headers)
             if resp.status_code == 200:
                 import xml.etree.ElementTree as ET
                 root = ET.fromstring(resp.text)
@@ -1902,6 +2002,12 @@ class SAPADTClient:
                         "type": "Workbench" if req_type == "K" else ("Customizing" if req_type == "W" else req_type),
                         "is_default": False,
                     })
+            else:
+                logger.warning(
+                    "CTS transport request query returned HTTP %d: %s",
+                    resp.status_code,
+                    resp.text[:200] if resp.text else "(empty body)",
+                )
         except Exception as e:
             logger.warning("Failed to fetch CTS transport requests: %s", e)
 

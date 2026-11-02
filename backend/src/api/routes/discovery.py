@@ -1,6 +1,6 @@
 """SAP Discovery API Routes."""
 
-from typing import List, Optional
+from typing import List, Optional, Union, Dict, Any
 from fastapi import APIRouter, Query
 from src.models.domain import CDSCandidate, CDSLayer
 from src.logging_config import logger
@@ -61,6 +61,7 @@ class DiscoveryRunPayload(BaseModel):
     selected_domains: Optional[List[str]] = None
     extraction_enabled_only: Optional[bool] = None
     require_delta_support: Optional[bool] = None
+    standard_only: bool = True
 
 
 @router.get("/metadata-status", summary="Gets real metadata index status and connection stats")
@@ -119,6 +120,7 @@ async def run_discovery_pipeline(payload: DiscoveryRunPayload):
         selected_domains=payload.selected_domains,
         extraction_enabled_only=payload.extraction_enabled_only,
         require_delta_support=payload.require_delta_support,
+        standard_only=payload.standard_only,
     )
 
 
@@ -172,54 +174,87 @@ async def sync_incremental_endpoint(payload: Optional[IncrementalSyncPayload] = 
     return await discovery_svc.sync_incremental(prefixes=pfx, max_per_prefix=max_pfx)
 
 
+from src.services.table_discovery_service import TableDiscoveryService
+
+table_discovery_svc = TableDiscoveryService()
+
+
+class TableDiscoveryPayload(BaseModel):
+    tables: Union[str, List[str]]
+    matching_mode: str = "ANY"
+    max_depth: int = 4
+    standard_only: bool = True
+
+
 @router.get("/table-lineage", summary="Discovers CDS views that consume one or multiple SAP tables as source, join, or association")
 async def get_table_lineage_query(
     tables: str = Query(..., description="SAP transparent table name(s), comma, space, or 'and' separated"),
-    extraction_enabled_only: bool = Query(False, description="Filter strictly to views confirmed in I_DataExtractionEnabledView"),
+    matching_mode: str = Query("ANY", description="'ANY' or 'ALL' table matching mode"),
+    extraction_enabled_only: bool = Query(True, description="Filter strictly to views confirmed in I_DataExtractionEnabledView"),
     require_delta_support: bool = Query(False, description="Require Delta Change Data Capture support"),
+    standard_only: bool = Query(True, description="Filter strictly to genuine standard SAP CDS views (excludes custom Z*/Y* views)"),
 ):
-    """Returns CDS views consuming the specified SAP table(s) as primary source, join, or association."""
+    """Returns unique CDS views consuming the specified SAP table(s) with positively verified extraction status."""
     tbl_clean = tables.strip()
-    print(f"\n>>> [SAP-CDS-AGENT] Table Lineage Query Received: '{tbl_clean}' (extraction_only={extraction_enabled_only}, delta={require_delta_support}) <<<", flush=True)
-    logger.info(f"[TableLineage] Searching CDS views for transparent table(s): {tbl_clean} (extraction_only={extraction_enabled_only}, delta={require_delta_support})")
-    result = await discovery_svc.get_table_lineage(
+    logger.info(f"[TableLineage] Searching CDS views for transparent table(s): {tbl_clean} (mode={matching_mode}, delta={require_delta_support}, standard_only={standard_only})")
+    result = await table_discovery_svc.run_discovery(
         tbl_clean,
-        extraction_enabled_only=extraction_enabled_only,
-        require_delta_support=require_delta_support,
+        matching_mode=matching_mode,
+        standard_only=standard_only,
     )
-    total = result.get("total_matches", 0)
-    comb_cnt = result.get("total_combined_matches", 0)
-    print(
-        f">>> [SAP-CDS-AGENT] Lineage Result for '{tbl_clean}': {total} matches "
-        f"({comb_cnt} combined views linking all tables) <<<\n",
-        flush=True,
-    )
+    if require_delta_support:
+        result["recommendations"] = [r for r in result["recommendations"] if r.get("cdc_status") == "CDC_SUPPORTED"]
+        result["summary_metrics"]["unique_extraction_recommended"] = len(result["recommendations"])
     return result
 
 
 @router.get("/table-lineage/{table_name:path}", summary="Discovers all CDS views that take a transparent SAP table as source, join, or association")
 async def get_table_lineage_endpoint(
     table_name: str,
-    extraction_enabled_only: bool = Query(False, description="Filter strictly to views confirmed in I_DataExtractionEnabledView"),
+    matching_mode: str = Query("ANY", description="'ANY' or 'ALL' table matching mode"),
+    extraction_enabled_only: bool = Query(True, description="Filter strictly to views confirmed in I_DataExtractionEnabledView"),
     require_delta_support: bool = Query(False, description="Require Delta Change Data Capture support"),
+    standard_only: bool = Query(True, description="Filter strictly to genuine standard SAP CDS views (excludes custom Z*/Y* views)"),
 ):
     """Returns all CDS views that consume the specified SAP table as primary source, join, or association."""
     tbl = table_name.strip()
-    print(f"\n>>> [SAP-CDS-AGENT] Table Lineage Path Received: '{tbl}' (extraction_only={extraction_enabled_only}, delta={require_delta_support}) <<<", flush=True)
-    logger.info(f"[TableLineage] Searching CDS views for transparent table(s): {tbl} (extraction_only={extraction_enabled_only}, delta={require_delta_support})")
-    result = await discovery_svc.get_table_lineage(
+    logger.info(f"[TableLineage] Searching CDS views for transparent table(s): {tbl} (mode={matching_mode}, delta={require_delta_support}, standard_only={standard_only})")
+    result = await table_discovery_svc.run_discovery(
         tbl,
-        extraction_enabled_only=extraction_enabled_only,
-        require_delta_support=require_delta_support,
+        matching_mode=matching_mode,
+        standard_only=standard_only,
     )
-    total = result.get("total_matches", 0)
-    comb_cnt = result.get("total_combined_matches", 0)
-    print(
-        f">>> [SAP-CDS-AGENT] Lineage Result for '{tbl}': {total} matches "
-        f"({comb_cnt} combined views linking all tables) <<<\n",
-        flush=True,
-    )
+    if require_delta_support:
+        result["recommendations"] = [r for r in result["recommendations"] if r.get("cdc_status") == "CDC_SUPPORTED"]
+        result["summary_metrics"]["unique_extraction_recommended"] = len(result["recommendations"])
     return result
+
+
+@router.post("/table-discovery/run", summary="Executes complete Table-to-CDS extraction discovery")
+async def run_table_discovery_endpoint(payload: TableDiscoveryPayload):
+    """Executes complete Table-to-CDS extraction discovery with recursive dependency graph and strict extraction verification."""
+    logger.info(f"[TableDiscovery] Run requested for tables: {payload.tables} (mode={payload.matching_mode}, standard_only={payload.standard_only})")
+    return await table_discovery_svc.run_discovery(
+        tables_input=payload.tables,
+        matching_mode=payload.matching_mode,
+        max_depth=payload.max_depth,
+        standard_only=payload.standard_only,
+    )
+
+
+@router.get("/table-discovery/runs", summary="Retrieves history of past table discovery runs")
+async def get_table_discovery_runs(limit: int = Query(50, ge=1, le=100)):
+    """Retrieves history of past table discovery runs stored in SQLite."""
+    return table_discovery_svc.get_run_history(limit=limit)
+
+
+@router.get("/table-discovery/runs/{run_id}", summary="Retrieves details and results for a specific discovery run")
+async def get_table_discovery_run_details(run_id: str):
+    """Retrieves details, inputs, results, and dependency paths for a specific discovery run."""
+    details = table_discovery_svc.get_run_details(run_id)
+    if not details:
+        return {"error": f"Run {run_id} not found", "run_id": run_id}
+    return details
 
 
 from src.services.cds_classifier import cds_classifier
