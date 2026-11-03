@@ -625,6 +625,33 @@ export interface WrapperGenerationResult {
   correction_history?: CorrectionLoopAttempt[];
   status: WorkflowStatus;
 }
+export interface ViewWrapperFieldMapping {
+  business_field: string;
+  source_field: string;
+  wrapper_target_field: string;
+  field_label: string;
+  data_type: string;
+  length: number;
+  decimals: number;
+  is_key: boolean;
+  evidence: string;
+}
 
+export interface ViewWrapperMappingItem {
+  source_cds_view: string;
+  source_label: string;
+  package: string;
+  wrapper_cds_view: string;
+  wrapper_sql_view_name: string;
+  wrapper_creation_status: string;
+  wrapper_activation_status: string;
+  created_at?: string;
+  field_mappings: ViewWrapperFieldMapping[];
+}
 
-
+export interface ViewsWrapperMappingResponse {
+  views_mapping: ViewWrapperMappingItem[];
+  total_views: number;
+  views_with_wrappers: number;
+  views_without_wrappers: number;
+}

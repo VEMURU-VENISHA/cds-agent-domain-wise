@@ -351,3 +351,144 @@ async def test_no_network_call_before_local_gates():
         await client.activate_ddls_object("ZI_ACTIVATION_TEST", review_package=pkg)
 
     assert call_count == 0  # Zero network calls reached mock transport
+
+
+# Test Q: Activation HTTP 200 does NOT report ACTIVE when object remains inactive in DDLS read-back
+@pytest.mark.asyncio
+async def test_activation_http_200_not_active_when_read_back_reports_inactive():
+    """Requirement 4: Do not report ACTIVE merely because the activation endpoint returned HTTP 200."""
+    inactive_ddls_xml = """<?xml version="1.0" encoding="utf-8"?>
+<ddl:ddlSource xmlns:ddl="http://www.sap.com/adt/ddic/ddlsources"
+               xmlns:adtcore="http://www.sap.com/adt/core"
+               adtcore:name="ZI_REMAINS_INACTIVE"
+               adtcore:version="inactive">
+</ddl:ddlSource>"""
+
+    activation_accepted_xml = """<?xml version="1.0" encoding="utf-8"?>
+<ioc:activationResult xmlns:ioc="http://www.sap.com/adt/activation">
+</ioc:activationResult>"""
+
+    async def mock_handler(request: httpx.Request) -> httpx.Response:
+        url_str = str(request.url)
+        if request.method == "GET" and "search" in url_str:
+            return httpx.Response(200, headers={"x-csrf-token": "CSRF_TOKEN_Q"}, text="<ok/>")
+        if request.method == "POST" and "activation" in url_str:
+            return httpx.Response(200, headers={"Content-Type": "application/xml"}, text=activation_accepted_xml)
+        if request.method == "GET" and "ddic/ddl/sources/zi_remains_inactive" in url_str:
+            return httpx.Response(200, headers={"Content-Type": "application/xml"}, text=inactive_ddls_xml)
+        if request.method == "GET" and "inactiveobjects" in url_str:
+            return httpx.Response(200, headers={"Content-Type": "application/xml"}, text="<inactivectsobjects/>")
+        return httpx.Response(404)
+
+    s = Settings(SAP_CONNECTOR_ENABLED=True, SAP_DEV_WRITE_ENABLED=True, SAP_LIVE_READ_ONLY=False)
+    mock_http = httpx.AsyncClient(transport=httpx.MockTransport(mock_handler), base_url="https://mock-sap:443")
+    client = SAPADTClient(settings=s, client=mock_http)
+    pkg = _make_approved_package("ZI_REMAINS_INACTIVE")
+
+    res = await client.activate_ddls_object("ZI_REMAINS_INACTIVE", review_package=pkg)
+
+    # Key assertions:
+    assert res["activation_request_accepted"] is True
+    assert res["activation_confirmed"] is False
+    assert res["success"] is False
+    assert res["activation_status"] == "INACTIVE"
+    assert "remains 'inactive' in SAP dictionary runtime" in res["error_message"]
+    assert res["verified_state"]["version"] == "inactive"
+    assert res["verified_state"]["is_active"] is False
+
+
+# Test R: Activation confirmed only when DDLS read-back confirms active version
+@pytest.mark.asyncio
+async def test_activation_confirmed_when_read_back_reports_active():
+    """Authoritative activation confirmed when descriptor returns active and absent from inactive queue."""
+    active_ddls_xml = """<?xml version="1.0" encoding="utf-8"?>
+<ddl:ddlSource xmlns:ddl="http://www.sap.com/adt/ddic/ddlsources"
+               xmlns:adtcore="http://www.sap.com/adt/core"
+               xmlns:atom="http://www.w3.org/2005/Atom"
+               adtcore:name="ZI_CONFIRMED_ACTIVE"
+               adtcore:version="active"
+               adtcore:changedAt="2026-11-03T18:00:00Z"
+               adtcore:changedBy="TESTUSER">
+  <atom:link href="/sap/bc/adt/ddic/logs/db/ACTDDLSZI_CONFIRMED_ACTIVE"
+             rel="http://www.sap.com/adt/relations/ddic/activationlog"
+             type="application/vnd.sap.adt.logs+xml"/>
+</ddl:ddlSource>"""
+
+    activation_accepted_xml = """<?xml version="1.0" encoding="utf-8"?>
+<ioc:activationResult xmlns:ioc="http://www.sap.com/adt/activation">
+</ioc:activationResult>"""
+
+    async def mock_handler(request: httpx.Request) -> httpx.Response:
+        url_str = str(request.url)
+        if request.method == "GET" and "search" in url_str:
+            return httpx.Response(200, headers={"x-csrf-token": "CSRF_TOKEN_R"}, text="<ok/>")
+        if request.method == "POST" and "activation" in url_str:
+            return httpx.Response(200, headers={"Content-Type": "application/xml"}, text=activation_accepted_xml)
+        if request.method == "GET" and "ddic/ddl/sources/zi_confirmed_active" in url_str:
+            return httpx.Response(200, headers={"Content-Type": "application/xml"}, text=active_ddls_xml)
+        if request.method == "GET" and "inactiveobjects" in url_str:
+            return httpx.Response(200, headers={"Content-Type": "application/xml"}, text="<inactivectsobjects/>")
+        return httpx.Response(404)
+
+    s = Settings(SAP_CONNECTOR_ENABLED=True, SAP_DEV_WRITE_ENABLED=True, SAP_LIVE_READ_ONLY=False)
+    mock_http = httpx.AsyncClient(transport=httpx.MockTransport(mock_handler), base_url="https://mock-sap:443")
+    client = SAPADTClient(settings=s, client=mock_http)
+    pkg = _make_approved_package("ZI_CONFIRMED_ACTIVE")
+
+    res = await client.activate_ddls_object("ZI_CONFIRMED_ACTIVE", review_package=pkg)
+
+    assert res["activation_request_accepted"] is True
+    assert res["activation_confirmed"] is True
+    assert res["success"] is True
+    assert res["activation_status"] == "ACTIVE"
+    assert res["error_message"] is None
+    assert res["verified_state"]["is_active"] is True
+    assert res["verified_state"]["version"] == "active"
+    assert res["activation_log_uri"] == "/sap/bc/adt/ddic/logs/db/ACTDDLSZI_CONFIRMED_ACTIVE"
+
+
+# Test S: Detailed message categorization (errors, warnings, infos)
+@pytest.mark.asyncio
+async def test_activation_categorizes_errors_warnings_infos():
+    """Requirements 1 & 2: Identify activation errors, warnings, and success messages returned by SAP."""
+    diagnostic_xml = """<?xml version="1.0" encoding="utf-8"?>
+<ioc:activationResult xmlns:ioc="http://www.sap.com/adt/activation" xmlns:chkl="http://www.sap.com/adt/checkrun">
+  <chkl:messages>
+    <msg type="E" line="10">
+      <shortText><txt>Syntax error: Table ACDOCA column XYZ not found</txt></shortText>
+    </msg>
+    <msg type="W" line="5">
+      <shortText><txt>Warning: Performance annotation missing</txt></shortText>
+    </msg>
+    <msg type="I" line="1">
+      <shortText><txt>Information: Header annotation parsed</txt></shortText>
+    </msg>
+  </chkl:messages>
+</ioc:activationResult>"""
+
+    async def mock_handler(request: httpx.Request) -> httpx.Response:
+        url_str = str(request.url)
+        if request.method == "GET":
+            return httpx.Response(200, headers={"x-csrf-token": "CSRF_TOKEN_S"}, text="<ok/>")
+        if request.method == "POST" and "activation" in url_str:
+            return httpx.Response(200, headers={"Content-Type": "application/xml"}, text=diagnostic_xml)
+        return httpx.Response(404)
+
+    s = Settings(SAP_CONNECTOR_ENABLED=True, SAP_DEV_WRITE_ENABLED=True, SAP_LIVE_READ_ONLY=False)
+    mock_http = httpx.AsyncClient(transport=httpx.MockTransport(mock_handler), base_url="https://mock-sap:443")
+    client = SAPADTClient(settings=s, client=mock_http)
+    pkg = _make_approved_package("ZI_DIAG_TEST")
+
+    res = await client.activate_ddls_object("ZI_DIAG_TEST", review_package=pkg)
+
+    assert res["success"] is False
+    assert res["has_blocking_errors"] is True
+    assert len(res["errors"]) == 1
+    assert res["errors"][0]["line"] == 10
+    assert "ACDOCA column XYZ not found" in res["errors"][0]["short_text"]
+    assert len(res["warnings"]) == 1
+    assert "Performance annotation missing" in res["warnings"][0]["short_text"]
+    assert len(res["infos"]) == 1
+    assert "Header annotation parsed" in res["infos"][0]["short_text"]
+    assert "Line 10: Syntax error: Table ACDOCA column XYZ not found" in res["error_message"]
+

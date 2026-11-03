@@ -6,6 +6,7 @@ import {
   TransportRequestItem,
   IncrementalSyncResult,
   ExtractionStatusResult,
+  ViewsWrapperMappingResponse,
 } from '../types';
 
 const API_BASE = '/api/v1';
@@ -507,6 +508,25 @@ export async function validateMemoryOnly(code: string, verifiedContext: any) {
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
     throw new Error(err?.detail || 'In-memory validation failed');
+  }
+  return res.json();
+}
+
+export async function fetchViewsWrapperMapping(
+  selectedViews: string[],
+  requiredFields?: any[]
+): Promise<ViewsWrapperMappingResponse> {
+  const res = await fetch(`${API_BASE}/requirements/views-wrapper-mapping`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      selected_views: selectedViews,
+      required_fields: requiredFields || null,
+    }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err?.detail || 'Failed to fetch views wrapper mapping');
   }
   return res.json();
 }

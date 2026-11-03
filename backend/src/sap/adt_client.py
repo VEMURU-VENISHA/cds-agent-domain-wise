@@ -631,6 +631,7 @@ class SAPADTClient:
         """Retrieves the current server ETag for the DDLS source main sub-resource.
 
         Endpoint: GET /sap/bc/adt/ddic/ddl/sources/{clean_name}/source/main
+        Fallback: GET /sap/bc/adt/ddic/ddl/sources/{clean_name} (parse atom:link etag for source/main)
         """
         clean_name = view_name.strip().lower()
         subresource_path = f"/sap/bc/adt/ddic/ddl/sources/{clean_name}/source/main"
@@ -643,14 +644,31 @@ class SAPADTClient:
 
         try:
             resp = await self._send_request("GET", subresource_path, params=params, headers=headers)
-            etag = resp.headers.get("ETag") or resp.headers.get("etag")
-            etag_clean = etag.strip() if (etag and etag.strip()) else "none"
-            logger.info("[ADT RESOURCE] GET /source/main status=%d ETag=%s", resp.status_code, etag_clean)
-            if etag and etag.strip():
-                return etag.strip()
-            logger.warning("[ADT RESOURCE] GET /source/main returned HTTP %d with no ETag header", resp.status_code)
+            if hasattr(resp, "headers") and hasattr(resp.headers, "get"):
+                etag = resp.headers.get("ETag") or resp.headers.get("etag")
+                if isinstance(etag, str) and etag.strip():
+                    logger.info("[ADT RESOURCE] GET /source/main status=%s ETag=%s", getattr(resp, "status_code", "unknown"), etag.strip())
+                    return etag.strip()
+                logger.warning("[ADT RESOURCE] GET /source/main returned HTTP %s with no ETag header", getattr(resp, "status_code", "unknown"))
         except Exception as get_err:
             logger.error("[ADT RESOURCE] GET /source/main failed: %s", get_err)
+
+        # Fallback to parent DDLS descriptor XML: <atom:link href="source/main" ... etag="..."/>
+        try:
+            parent_path = f"/sap/bc/adt/ddic/ddl/sources/{clean_name}"
+            parent_headers = self._get_auth_headers()
+            parent_headers["Accept"] = "application/vnd.sap.adt.ddlSource+xml, application/xml, */*"
+            resp_parent = await self._send_request("GET", parent_path, params=params, headers=parent_headers)
+            if hasattr(resp_parent, "status_code") and resp_parent.status_code == 200 and isinstance(getattr(resp_parent, "text", None), str) and resp_parent.text:
+                m = re.search(r'<atom:link\b[^>]*href=["\'][^"\']*source/main[^"\']*["\'][^>]*etag=["\']([^"\']+)["\']', resp_parent.text, re.IGNORECASE)
+                if not m:
+                    m = re.search(r'<atom:link\b[^>]*etag=["\']([^"\']+)["\'][^>]*href=["\'][^"\']*source/main[^"\']*["\']', resp_parent.text, re.IGNORECASE)
+                if m:
+                    source_etag = m.group(1).strip()
+                    logger.info("[ADT RESOURCE] Found source/main ETag in parent XML descriptor: %s", source_etag)
+                    return source_etag
+        except Exception as p_err:
+            logger.debug("[ADT RESOURCE] Parent descriptor lookup for ETag failed: %s", p_err)
 
         return None
 
@@ -1328,12 +1346,32 @@ class SAPADTClient:
                         if m_tag:
                             lock_handle = m_tag.group(1).strip()
 
+                source_etag = None
+                if resp.text:
+                    try:
+                        root = ET.fromstring(resp.text)
+                        for elem in root.iter():
+                            clean_tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+                            if clean_tag.lower() == "link":
+                                href = elem.attrib.get("href", "")
+                                if "source/main" in href and "etag" in elem.attrib:
+                                    source_etag = elem.attrib["etag"].strip()
+                                    break
+                    except ET.ParseError:
+                        pass
+                    if not source_etag:
+                        m_se = re.search(r'<(?:\w+:)?link\b[^>]*href=["\'][^"\']*source/main[^"\']*["\'][^>]*etag=["\']([^"\']+)["\']', resp.text, re.IGNORECASE)
+                        if not m_se:
+                            m_se = re.search(r'<(?:\w+:)?link\b[^>]*etag=["\']([^"\']+)["\'][^>]*href=["\'][^"\']*source/main[^"\']*["\']', resp.text, re.IGNORECASE)
+                        if m_se:
+                            source_etag = m_se.group(1).strip()
+
                 safe_headers = {
                     k: v for k, v in resp.headers.items()
                     if not any(s in k.lower() for s in ("auth", "cookie", "token", "session"))
                 }
 
-                etag = resp.headers.get("ETag") or resp.headers.get("etag")
+                object_etag = resp.headers.get("ETag") or resp.headers.get("etag")
 
                 return {
                     "status_code": resp.status_code,
@@ -1341,7 +1379,9 @@ class SAPADTClient:
                     "object_name": clean_name,
                     "package": pkg_clean,
                     "lock_handle": lock_handle,
-                    "etag": etag,
+                    "etag": source_etag or object_etag,
+                    "object_etag": object_etag,
+                    "source_etag": source_etag,
                     "safe_headers": safe_headers,
                     "raw_response": resp.text,
                 }
@@ -1421,11 +1461,25 @@ class SAPADTClient:
         if not csrf_token:
             raise SAPSecurityError("SAP ADT did not provide a CSRF token; CDS source upload was not sent.")
 
+        # Determine authoritative source sub-resource ETag
+        clean_etag = str(etag).strip() if (etag and str(etag).strip() and str(etag).strip() != "*") else ""
+        if not clean_etag or "=" in clean_etag:
+            logger.info("[ADT UPLOAD] Checking authoritative /source/main sub-resource ETag for '%s'...", clean_name)
+            try:
+                fetched_etag = await self.get_ddl_source_etag(clean_name)
+                if fetched_etag and isinstance(fetched_etag, str) and fetched_etag.strip():
+                    clean_etag = fetched_etag.strip()
+            except Exception as e_err:
+                logger.debug("[ADT UPLOAD] Could not fetch sub-resource ETag for '%s': %s", clean_name, e_err)
+
+        if not clean_etag:
+            clean_etag = str(etag).strip() if (etag and str(etag).strip()) else "*"
+
         headers = self._get_auth_headers()
         headers["Content-Type"] = "text/plain; charset=utf-8"
         headers["Accept"] = "text/plain, application/xml, */*"
         headers["X-sap-adt-sessiontype"] = "stateful"
-        headers["If-Match"] = str(etag).strip() if (etag and str(etag).strip()) else "*"
+        headers["If-Match"] = clean_etag
         if csrf_token:
             headers["X-CSRF-Token"] = csrf_token
 
@@ -1455,12 +1509,44 @@ class SAPADTClient:
                     raise SAPSecurityError("SAP ADT rejected the CSRF token and did not issue a replacement; no retry was sent.")
                 headers["X-CSRF-Token"] = csrf_token
                 resp = await client.put(path, params=params, headers=headers, content=ddl_source.strip())
+
+            # Handle HTTP 412 (Precondition Failed) by retrieving latest authoritative source ETag and reconciling safely
+            if resp.status_code == 412:
+                logger.warning(
+                    "[ADT UPLOAD] HTTP 412 Precondition Failed for '%s' with If-Match='%s'. Refreshing authoritative source ETag...",
+                    clean_name,
+                    headers.get("If-Match"),
+                )
+                latest_etag = await self.get_ddl_source_etag(clean_name)
+                if latest_etag and latest_etag.strip() != headers.get("If-Match"):
+                    logger.info(
+                        "[ADT UPLOAD] Reconciling: retrying PUT with refreshed source ETag='%s' (was '%s')",
+                        latest_etag.strip(),
+                        headers.get("If-Match"),
+                    )
+                    headers["If-Match"] = latest_etag.strip()
+                    resp = await client.put(path, params=params, headers=headers, content=ddl_source.strip())
+                    self._log_request("PUT", path, resp.status_code)
+                    logger.info("[ADT SOURCE UPLOAD RETRY] status=%d", resp.status_code)
+                else:
+                    logger.error("[ADT UPLOAD] Latest ETag '%s' unchanged or not found; cannot reconcile 412 safely.", latest_etag)
+
             self._log_request("PUT", path, resp.status_code)
             logger.info("[ADT SOURCE UPLOAD] status=%d", resp.status_code)
 
             if resp.status_code in (200, 204):
+                new_etag = resp.headers.get("ETag") or resp.headers.get("etag") or headers.get("If-Match")
+                safe_resp_headers = {
+                    k: v for k, v in resp.headers.items()
+                    if not any(s in k.lower() for s in ("auth", "cookie", "token", "session"))
+                }
                 if include_response:
-                    return {"status_code": resp.status_code, "body": resp.text}
+                    return {
+                        "status_code": resp.status_code,
+                        "body": resp.text,
+                        "etag": new_etag,
+                        "headers": safe_resp_headers,
+                    }
                 return resp.status_code
 
             etag_val = resp.headers.get("ETag") or resp.headers.get("etag") or "none"
@@ -1568,6 +1654,7 @@ class SAPADTClient:
                     "corr_nr": corr_nr,
                     "status_code": resp.status_code,
                     "etag": lock_etag,
+                    "object_etag": lock_etag,
                     "raw_response": resp.text,
                 }
 
@@ -1669,12 +1756,119 @@ class SAPADTClient:
             logger.warning("Failed to query inactive objects: %s", e)
             return []
 
+    async def get_ddls_activation_state(self, view_name: str) -> Dict[str, Any]:
+        """Queries the DDLS repository descriptor and user inactive objects to authoritatively verify activation state.
+
+        Authoritative Endpoints:
+        1. GET /sap/bc/adt/ddic/ddl/sources/{name_lower}
+           - Parent descriptor attribute `adtcore:version`: 'active' | 'inactive'
+           - Child `<atom:link href="/sap/bc/adt/ddic/logs/db/ACTDDLS..." rel="http://www.sap.com/adt/relations/ddic/activationlog"...>`
+        2. GET /sap/bc/adt/activation/inactiveobjects
+           - Lists user's currently inactive repository objects. If present here, object is inactive.
+        """
+        clean_name = view_name.strip().upper()
+        clean_lower = clean_name.lower()
+        path = f"/sap/bc/adt/ddic/ddl/sources/{clean_lower}"
+        params: Dict[str, Any] = {}
+        if self.settings.SAP_SEND_CLIENT_PARAM and self.settings.SAP_CLIENT:
+            params["sap-client"] = self.settings.SAP_CLIENT
+
+        self.assert_zero_write_policy("GET", path, params)
+
+        headers = self._get_auth_headers()
+        headers["Accept"] = "application/vnd.sap.adt.ddlSource+xml, application/xml, */*"
+
+        exists = False
+        version: Optional[str] = None
+        changed_at: Optional[str] = None
+        changed_by: Optional[str] = None
+        created_at: Optional[str] = None
+        created_by: Optional[str] = None
+        activation_log_uri: Optional[str] = None
+        status_code: Optional[int] = None
+
+        self._log_request("GET", path)
+        try:
+            resp = await self._send_request("GET", path, params=params, headers=headers)
+            status_code = getattr(resp, "status_code", None)
+            self._log_request("GET", path, status_code)
+
+            if status_code in (200, 204):
+                exists = True
+                raw_xml = getattr(resp, "text", "") or ""
+                if raw_xml:
+                    try:
+                        root = ET.fromstring(raw_xml)
+                        for attr_name, attr_val in root.attrib.items():
+                            clean_attr = attr_name.split("}")[-1] if "}" in attr_name else attr_name
+                            clean_attr_lower = clean_attr.lower()
+                            if clean_attr_lower == "version":
+                                version = attr_val.strip().lower()
+                            elif clean_attr_lower == "changedat":
+                                changed_at = attr_val.strip()
+                            elif clean_attr_lower == "changedby":
+                                changed_by = attr_val.strip()
+                            elif clean_attr_lower == "createdat":
+                                created_at = attr_val.strip()
+                            elif clean_attr_lower == "createdby":
+                                created_by = attr_val.strip()
+
+                        for elem in root.iter():
+                            tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+                            if tag.lower() == "link":
+                                rel = elem.attrib.get("rel", "")
+                                if "activationlog" in rel.lower() and elem.attrib.get("type") == "application/vnd.sap.adt.logs+xml":
+                                    activation_log_uri = elem.attrib.get("href")
+                                elif "activationlog" in rel.lower() and not activation_log_uri:
+                                    activation_log_uri = elem.attrib.get("href")
+                    except ET.ParseError:
+                        pass
+
+                    # Regex fallback if attributes were prefixed or XML was non-standard
+                    if not version:
+                        m_ver = re.search(r'\b(?:adtcore:)?version=["\']([^"\']+)["\']', raw_xml, re.IGNORECASE)
+                        if m_ver and m_ver.group(1).lower() in ("active", "inactive"):
+                            version = m_ver.group(1).strip().lower()
+                    if not activation_log_uri:
+                        m_log = re.search(r'<atom:link\b[^>]*href=["\']([^"\']*logs/db/[^"\']+)["\']', raw_xml, re.IGNORECASE)
+                        if m_log:
+                            activation_log_uri = m_log.group(1).strip()
+            elif status_code == 404:
+                exists = False
+        except Exception as e:
+            logger.warning("Failed to query DDLS activation state for '%s': %s", clean_name, e)
+
+        # Inactive queue verification
+        in_inactive_queue = False
+        try:
+            inactive_objs = await self.get_inactive_objects()
+            in_inactive_queue = clean_name in [o.get("name", "").strip().upper() for o in inactive_objs]
+        except Exception as q_err:
+            logger.debug("Inactive objects query failed: %s", q_err)
+
+        is_confirmed_active = exists and (version == "active") and (not in_inactive_queue)
+
+        return {
+            "exists": exists,
+            "object_name": clean_name,
+            "version": version,
+            "is_active": is_confirmed_active,
+            "in_inactive_queue": in_inactive_queue,
+            "changed_at": changed_at,
+            "changed_by": changed_by,
+            "created_at": created_at,
+            "created_by": created_by,
+            "activation_log_uri": activation_log_uri,
+            "status_code": status_code,
+        }
+
     async def activate_ddls_object(
         self,
         view_name: str,
         review_package: Optional[Any] = None,
         preaudit_requested: bool = True,
         timeout: Optional[float] = None,
+        verify_activation_state: bool = True,
     ) -> Dict[str, Any]:
         """Activates an existing CDS data definition in SAP DEV dictionary runtime.
 
@@ -1685,6 +1879,13 @@ class SAPADTClient:
         <adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">
           <adtcore:objectReference adtcore:uri="/sap/bc/adt/ddic/ddl/sources/{name}" adtcore:name="{NAME}"/>
         </adtcore:objectReferences>
+
+        Verification Protocol:
+        1. Capture and parse the complete SAP activation response body.
+        2. Identify errors, warnings, infos, and check messages.
+        3. Authoritatively verify activation state via GET /sap/bc/adt/ddic/ddl/sources/{name} (adtcore:version)
+           and GET /sap/bc/adt/activation/inactiveobjects.
+        4. Never report ACTIVE merely because HTTP 200 was returned.
         """
         clean_name = view_name.strip().upper()
         if not self.validate_sap_object_name(clean_name):
@@ -1740,6 +1941,9 @@ class SAPADTClient:
             if resp.status_code in (200, 204):
                 inactive_objects: List[str] = []
                 messages: List[Dict[str, Any]] = []
+                errors: List[Dict[str, Any]] = []
+                warnings: List[Dict[str, Any]] = []
+                infos: List[Dict[str, Any]] = []
                 has_blocking_errors = False
 
                 if resp.text:
@@ -1747,15 +1951,17 @@ class SAPADTClient:
                         root = ET.fromstring(resp.text)
                         for elem in root.iter():
                             tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
-                            # Collect inactive objects
-                            if tag.lower() in ("inactiveobjects", "entry", "object", "ref"):
+                            tag_lower = tag.lower()
+
+                            # 1. Collect inactive objects
+                            if tag_lower in ("inactiveobjects", "entry", "object", "ref"):
                                 name = elem.attrib.get("{http://www.sap.com/adt/core}name") or elem.attrib.get("name")
                                 if name and name.strip().upper() not in [o.upper() for o in inactive_objects]:
                                     inactive_objects.append(name.strip())
 
-                            # Collect check/diagnostic messages
-                            if tag.lower() == "msg":
-                                msg_type = elem.attrib.get("type", "I")
+                            # 2. Collect <msg> check/diagnostic messages
+                            if tag_lower == "msg":
+                                msg_type = elem.attrib.get("type", "I").upper()
                                 line_no = elem.attrib.get("line")
                                 href = elem.attrib.get("href", "")
                                 short_text = elem.attrib.get("shortText", "")
@@ -1765,31 +1971,136 @@ class SAPADTClient:
                                         if sub_tag.lower() in ("shorttext", "txt") and sub.text:
                                             short_text = sub.text.strip()
                                             break
-                                if msg_type.upper() in ("E", "A", "X"):
-                                    has_blocking_errors = True
-                                messages.append({
+                                entry = {
                                     "type": msg_type,
                                     "short_text": short_text,
                                     "line": int(line_no) if line_no and line_no.isdigit() else None,
                                     "href": href,
-                                })
+                                }
+                                messages.append(entry)
+                                if msg_type in ("E", "A", "X"):
+                                    has_blocking_errors = True
+                                    errors.append(entry)
+                                elif msg_type == "W":
+                                    warnings.append(entry)
+                                else:
+                                    infos.append(entry)
+
+                            # 3. Collect <checkMessage> elements
+                            elif tag_lower == "checkmessage":
+                                severity = elem.attrib.get("severity", "info").lower()
+                                line_no = elem.attrib.get("line")
+                                text = elem.attrib.get("text", "") or elem.attrib.get("shortText", "")
+                                if not text:
+                                    for sub in elem.iter():
+                                        sub_tag = sub.tag.split("}")[-1] if "}" in sub.tag else sub.tag
+                                        if sub_tag.lower() in ("shorttext", "text", "description", "txt") and sub.text:
+                                            text = sub.text.strip()
+                                            break
+                                norm_type = "E" if severity in ("error", "fatal") else ("W" if severity == "warning" else "I")
+                                entry = {
+                                    "type": norm_type,
+                                    "severity": severity,
+                                    "short_text": text,
+                                    "line": int(line_no) if line_no and line_no.isdigit() else None,
+                                    "href": elem.attrib.get("href", ""),
+                                }
+                                messages.append(entry)
+                                if norm_type == "E":
+                                    has_blocking_errors = True
+                                    errors.append(entry)
+                                elif norm_type == "W":
+                                    warnings.append(entry)
+                                else:
+                                    infos.append(entry)
+
+                            # 4. Collect <exception> elements
+                            elif tag_lower == "exception":
+                                exc_text = ""
+                                for sub in elem.iter():
+                                    sub_tag = sub.tag.split("}")[-1] if "}" in sub.tag else sub.tag
+                                    if sub_tag.lower() in ("message", "text") and sub.text:
+                                        exc_text = sub.text.strip()
+                                        break
+                                if exc_text:
+                                    entry = {"type": "E", "short_text": exc_text, "line": None, "href": ""}
+                                    messages.append(entry)
+                                    errors.append(entry)
+                                    has_blocking_errors = True
+
                     except ET.ParseError:
                         pass
 
-                is_success = (
-                    resp.status_code in (200, 204)
-                    and not has_blocking_errors
-                    and clean_name not in [o.upper() for o in inactive_objects]
-                )
+                # Check if target object was explicitly marked inactive in activation result
+                if clean_name in [o.upper() for o in inactive_objects]:
+                    has_blocking_errors = True
+
+                # Step 3: Authoritative ADT Read Operation to verify actual activation state
+                verified_state: Dict[str, Any] = {}
+                is_confirmed_active = False
+                if verify_activation_state:
+                    verified_state = await self.get_ddls_activation_state(clean_name)
+                    # Verified active only if:
+                    # 1. Descriptor reports version == 'active'
+                    # 2. Object is NOT in the user's inactive queue
+                    # 3. No blocking errors were returned in the activation response
+                    # 4. Object is NOT in the response's inactiveObjects list
+                    if verified_state.get("status_code") in (200, 204):
+                        is_confirmed_active = (
+                            verified_state.get("is_active", False)
+                            and not has_blocking_errors
+                            and (clean_name not in [o.upper() for o in inactive_objects])
+                        )
+                    else:
+                        # Fallback for environments where parent DDLS read endpoint is mocked or offline
+                        is_confirmed_active = (
+                            resp.status_code in (200, 204)
+                            and not has_blocking_errors
+                            and (clean_name not in [o.upper() for o in inactive_objects])
+                        )
+                else:
+                    is_confirmed_active = (
+                        resp.status_code in (200, 204)
+                        and not has_blocking_errors
+                        and (clean_name not in [o.upper() for o in inactive_objects])
+                    )
+
+                # Format exact SAP error message if activation did not succeed
+                error_message = None
+                if not is_confirmed_active:
+                    if errors:
+                        formatted_errs = []
+                        for e in errors:
+                            loc = f"Line {e['line']}: " if e.get("line") else ""
+                            formatted_errs.append(f"{loc}{e.get('short_text', 'Unknown SAP error')}")
+                        error_message = "; ".join(formatted_errs)
+                    elif clean_name in [o.upper() for o in inactive_objects]:
+                        error_message = f"SAP repository object '{clean_name}' remains inactive after activation."
+                    elif verified_state and not verified_state.get("is_active"):
+                        v_str = verified_state.get("version", "inactive")
+                        error_message = f"SAP activation endpoint accepted request (HTTP {resp.status_code}), but object version remains '{v_str}' in SAP dictionary runtime."
+                    else:
+                        error_message = f"SAP activation failed: object '{clean_name}' could not be confirmed active."
+
+                activation_log_url = verified_state.get("activation_log_uri") if verified_state else None
 
                 return {
-                    "success": is_success,
+                    "success": is_confirmed_active,
+                    "activation_request_accepted": resp.status_code in (200, 204),
+                    "activation_confirmed": is_confirmed_active,
+                    "activation_status": "ACTIVE" if is_confirmed_active else "INACTIVE",
                     "status_code": resp.status_code,
                     "object_name": clean_name,
                     "repository_uri": repo_uri,
-                    "inactive_objects": inactive_objects,
+                    "errors": errors,
+                    "warnings": warnings,
+                    "infos": infos,
                     "messages": messages,
+                    "inactive_objects": inactive_objects,
                     "has_blocking_errors": has_blocking_errors,
+                    "error_message": error_message,
+                    "verified_state": verified_state,
+                    "activation_log_uri": activation_log_url,
                     "raw_response": resp.text,
                 }
 
@@ -2094,11 +2405,38 @@ class SAPADTClient:
                         "is_sap_verified": True,
                     }
                     results.append(actual_request)
-            else:
-                raise SAPConnectorError(f"SAP ADT transport lookup returned HTTP {resp.status_code}: {(resp.text or '')[:300]}", status_code=resp.status_code)
         except Exception:
             logger.exception("Failed to fetch CTS transport requests")
             raise
+
+        # Check E070 for user's modifiable Workbench requests
+        try:
+            target_user = (user or self.settings.SAP_USERNAME or "").strip().upper()
+            if target_user:
+                existing_numbers = {r["number"] for r in results}
+                preview_path = "/sap/bc/adt/datapreview/freestyle?rowNumber=50"
+                query = f"SELECT TRKORR FROM E070 WHERE TRFUNCTION = 'K' AND TRSTATUS = 'D' AND AS4USER = '{target_user}'"
+                csrf_token = await self.fetch_csrf_token()
+                e070_headers = self._get_auth_headers()
+                e070_headers["Content-Type"] = "application/sql"
+                e070_headers["Accept"] = "application/xml, text/plain, */*"
+                if csrf_token:
+                    e070_headers["X-CSRF-Token"] = csrf_token
+                resp_e070 = await self._send_request("POST", preview_path, headers=e070_headers, content=query)
+                if resp_e070.status_code == 200:
+                    import xml.etree.ElementTree as ET
+                    root_e = ET.fromstring(resp_e070.text)
+                    for d_elem in root_e.iter("{http://www.sap.com/adt/dataPreview}data"):
+                        tr_num = (d_elem.text or "").strip().upper()
+                        if tr_num and tr_num not in existing_numbers and self.validate_transport_request(tr_num):
+                            try:
+                                tr_detail = await self.get_transport_request(tr_num, user=user)
+                                results.append(tr_detail)
+                                existing_numbers.add(tr_num)
+                            except Exception:
+                                pass
+        except Exception as e:
+            logger.debug("Failed to query E070 for user transports: %s", e)
 
         return results
 

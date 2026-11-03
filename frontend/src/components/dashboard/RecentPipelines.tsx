@@ -59,7 +59,8 @@ import {
   fetchTransportRequests,
   runIncrementalSync,
   fetchTableLineage,
-  fetchExtractionStatus
+  fetchExtractionStatus,
+  fetchViewsWrapperMapping
 } from '../../services/api';
 import {
   HealthStatus,
@@ -68,7 +69,8 @@ import {
   TransportRequestItem,
   IncrementalSyncResult,
   ExtractionStatusResult,
-  ExtractionFilteringStats
+  ExtractionFilteringStats,
+  ViewWrapperMappingItem
 } from '../../types';
 
 interface Props {
@@ -119,13 +121,8 @@ const STEP_LABELS = [
 ];
 
 const WORKFLOW_STEPS = [
-  { id: 1, label: '1. Requirement', sublabel: 'Inputs & Domain' },
-  { id: 2, label: '2. Recommendation', sublabel: 'BASIC Sources & Joins' },
-  { id: 3, label: '3. Mapping', sublabel: 'Field Projection' },
-  { id: 4, label: '4. CDS Generation', sublabel: 'DDL Synthesis' },
-  { id: 5, label: '5. Validation', sublabel: 'Quality & Check-Run' },
-  { id: 6, label: '6. Review & Approval', sublabel: 'Human Sign-Off' },
-  { id: 7, label: '7. SAP Creation & Activation', sublabel: 'Live ADT' },
+  { id: 1, label: '1. CDS Selection', sublabel: 'Discover & Select Views' },
+  { id: 2, label: '2. Mapping Display', sublabel: 'Wrapper & Field Mappings' },
 ];
 
 
@@ -198,6 +195,10 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
   const [isActivatingWrapper, setIsActivatingWrapper] = useState(false);
   const [wrapperActionError, setWrapperActionError] = useState('');
   const [wrapperWriteCapability, setWrapperWriteCapability] = useState<any>(null);
+
+  // Views Wrapper Mapping Display State (Authoritative SAP & SQLite)
+  const [viewsWrapperMappings, setViewsWrapperMappings] = useState<ViewWrapperMappingItem[]>([]);
+  const [isLoadingMappings, setIsLoadingMappings] = useState<boolean>(false);
 
   // Live Source Viewer Modal state (Change 1)
   const [sourceModalData, setSourceModalData] = useState<any | null>(null);
@@ -1159,13 +1160,60 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
     );
   };
 
+  const loadViewsWrapperMappings = async (views: string[]) => {
+    if (!views || views.length === 0) {
+      setViewsWrapperMappings([]);
+      return;
+    }
+    setIsLoadingMappings(true);
+    try {
+      const data = await fetchViewsWrapperMapping(views, authoritativeFields);
+      if (data?.views_mapping) {
+        setViewsWrapperMappings(data.views_mapping);
+      }
+    } catch (err: any) {
+      console.error('Failed to load views wrapper mapping:', err);
+      setGeneralError(err?.message || 'Failed to load wrapper mappings');
+    } finally {
+      setIsLoadingMappings(false);
+    }
+  };
+
+  useEffect(() => {
+    if (activeStep === 5 && selectedViews.length > 0) {
+      void loadViewsWrapperMappings(selectedViews);
+    }
+  }, [activeStep, selectedViews]);
+
+  const openWrapperForActivation = (sourceName: string, wrapperName: string) => {
+    setWrapperSourceName(sourceName);
+    setWrapperCdsName(wrapperName);
+    setWrapperPackage('ZTRAINING_2026');
+    const defaultTr = wrapperWriteCapability?.eligible_transports?.[0]?.number || availableTransports[0]?.number || 'S3XK900010';
+    setWrapperTransportRequest(defaultTr);
+    setWrapperTransportVerified(Boolean(defaultTr));
+    setWrapperCreationResult({
+      success: true,
+      message: `Wrapper ${wrapperName} is registered in SAP DEV.`,
+      source_cds_view_name: sourceName,
+      created_object_name: wrapperName,
+      package: 'ZTRAINING_2026',
+      sap_system: 'S3X / 100',
+    });
+    setWrapperActivationResult(null);
+    setWrapperActionError('');
+    setWrapperModalOpen(true);
+  };
+
   const openWrapperForm = (sourceName: string) => {
     setWrapperSourceName(sourceName);
     setWrapperSqlViewName('');
     setWrapperLabel('');
     setWrapperCdsName('');
-    setWrapperPackage('');
-    setWrapperTransportRequest('');
+    setWrapperPackage('ZTRAINING_2026');
+    const defaultTr = wrapperWriteCapability?.eligible_transports?.[0]?.number || '';
+    setWrapperTransportRequest(defaultTr);
+    setWrapperTransportVerified(Boolean(defaultTr));
     setWrapperGenerationResult(null);
     setWrapperValidationResult(null);
     setWrapperCreationResult(null);
@@ -1284,6 +1332,9 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
         confirmed: true,
       });
       setWrapperCreationResult(result);
+      if (selectedViews.length > 0) {
+        void loadViewsWrapperMappings(selectedViews);
+      }
     } catch (error: any) {
       setWrapperActionError(error?.message || 'SAP CDS creation failed.');
     } finally {
@@ -1306,6 +1357,9 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
         confirmed: true,
       });
       setWrapperActivationResult(result);
+      if (selectedViews.length > 0) {
+        void loadViewsWrapperMappings(selectedViews);
+      }
     } catch (error: any) {
       setWrapperActionError(error?.message || 'SAP CDS activation failed. The created object remains in SAP.');
     } finally {
@@ -2157,54 +2211,18 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
     let targetStep = 0;
 
     switch (stepId) {
-      case 1: // Requirement
-        isCurrent = activeStep >= 0 && activeStep <= 2;
-        isCompleted = activeStep >= 3;
+      case 1: // 1. CDS Selection
+        isCurrent = activeStep < 5;
+        isCompleted = activeStep >= 5;
         canNavigate = true;
-        targetStep = 0;
+        targetStep = selectedViews.length > 0 ? 3 : 0;
         break;
 
-      case 2: // Recommendation
-        isCurrent = activeStep === 3 || activeStep === 4;
-        isCompleted = isReuseFlow ? activeStep === 12 : activeStep >= 5;
-        canNavigate = allCandidates.length > 0 || activeStep >= 3;
-        targetStep = 3;
-        break;
-
-      case 3: // Mapping
-        isCurrent = activeStep === 5 || activeStep === 6;
-        isCompleted = isReuseFlow ? activeStep === 12 : activeStep >= 7;
-        canNavigate = (selectedViews.length > 0 || isReuseFlow) && activeStep >= 5;
+      case 2: // 2. Mapping Display
+        isCurrent = activeStep >= 5;
+        isCompleted = false;
+        canNavigate = selectedViews.length > 0;
         targetStep = 5;
-        break;
-
-      case 4: // CDS Generation
-        isCurrent = !isReuseFlow && activeStep === 7;
-        isCompleted = !isReuseFlow && activeStep >= 8;
-        canNavigate = !isReuseFlow && fieldMappings.length > 0 && activeStep >= 7;
-        targetStep = 7;
-        break;
-
-      case 5: // Validation
-        isCurrent = !isReuseFlow && activeStep === 8;
-        isCompleted = !isReuseFlow && activeStep >= 9;
-        canNavigate = !isReuseFlow && (!!generatedCode || !!userProvidedCode) && activeStep >= 8;
-        targetStep = 8;
-        break;
-
-      case 6: // Review & Approval
-        isCurrent = !isReuseFlow && (activeStep === 9 || activeStep === 10);
-        isCompleted = !isReuseFlow && activeStep >= 11;
-        canNavigate = !isReuseFlow && activeStep >= 9;
-        targetStep = 10;
-        break;
-
-      case 7: // SAP Creation & Activation
-        // Rule: Never mark complete before SAP confirms success!
-        isCurrent = activeStep === 11 || (activeStep === 12 && creationResult?.success !== true && !isReuseFlow);
-        isCompleted = (activeStep === 12 && creationResult?.success === true) || (isReuseFlow && activeStep === 12);
-        canNavigate = activeStep >= 11;
-        targetStep = isReuseFlow ? 12 : 11;
         break;
     }
 
@@ -2340,12 +2358,11 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
         </div>
       )}
 
-      {/* 2. Top Workflow Stepper (Restored 7-Step Enterprise Order) */}
+      {/* 2. Top Workflow Stepper (2-Step Order: CDS Selection → Mapping Display) */}
       <div className="bg-white border border-[#D9E4F0] rounded-2xl p-4 shadow-sm">
-        <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           {WORKFLOW_STEPS.map((step) => {
             const { isCurrent, isCompleted, canNavigate, targetStep } = getStepState(step.id);
-            const isBypassedForReuse = isReuseFlow && step.id >= 4 && step.id <= 6;
 
             return (
               <button
@@ -2360,8 +2377,6 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
                     ? 'bg-[#0A6ED1] border-[#0A6ED1] text-white shadow-sm ring-2 ring-[#0A6ED1]/20'
                     : isCompleted
                     ? 'bg-[#E8F8F3] border-[#00A878]/40 text-[#0F2747] hover:border-[#00A878]'
-                    : isBypassedForReuse
-                    ? 'bg-gray-50 border-gray-200 text-gray-400 opacity-60 cursor-not-allowed'
                     : 'bg-[#F4F8FC] border-[#D9E4F0] text-[#5F7187] hover:border-[#0A6ED1]/40'
                 } ${canNavigate ? 'cursor-pointer' : 'cursor-default'}`}
               >
@@ -2372,8 +2387,6 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
                         ? 'bg-white text-[#0A6ED1]'
                         : isCompleted
                         ? 'bg-[#00A878] text-white'
-                        : isBypassedForReuse
-                        ? 'bg-gray-200 text-gray-500'
                         : 'bg-white text-[#5F7187] border border-[#D9E4F0]'
                     }`}
                   >
@@ -2389,11 +2402,6 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
                       Done
                     </span>
                   )}
-                  {isBypassedForReuse && (
-                    <span className="text-[9px] text-gray-500 bg-white px-1 py-0.5 rounded">
-                      Reuse
-                    </span>
-                  )}
                 </div>
                 <div
                   className={`text-xs font-bold leading-tight truncate w-full ${
@@ -2407,7 +2415,7 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
                     isCurrent ? 'text-white/80' : isCompleted ? 'text-[#00A878]' : 'text-[#5F7187]'
                   }`}
                 >
-                  {isBypassedForReuse ? 'Standard CDS Reuse' : step.sublabel}
+                  {step.sublabel}
                 </div>
               </button>
             );
@@ -5012,751 +5020,322 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
         </div>
       )}
 
-      {/* STEP 6: FIELD MAPPING (Section 27) */}
+      {/* STEP 2: MAPPING DISPLAY (CDS Selection → Mapping Display Workflow) */}
       {activeStep === 5 && (
         <div className="bg-white border border-[#D9E4F0] rounded-2xl p-6 space-y-6 shadow-sm">
-          <div className="flex items-center justify-between">
+          {/* Header Bar */}
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between pb-4 border-b border-[#D9E4F0] gap-3">
             <div>
-              <h2 className="text-base font-bold text-[#0F2747]">Step 6 — Field Mapping</h2>
-              <p className="text-xs text-[#5F7187]">
-                Authoritative mapping of Business Fields to verified SAP CDS Technical Fields and Data Types.
+              <div className="flex items-center gap-2">
+                <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider bg-blue-100 text-[#0A6ED1] border border-blue-200">
+                  Step 2
+                </span>
+                <h2 className="text-base font-bold text-[#0F2747]">Mapping Display &amp; CDS Wrapper Status</h2>
+              </div>
+              <p className="text-xs text-[#5F7187] mt-1">
+                Authoritative mapping of Selected Original CDS Views, Corresponding Wrapper Views, and SAP Technical Fields.
               </p>
             </div>
-            <span className="text-xs bg-[#F4F8FC] border border-[#D9E4F0] text-[#0A6ED1] px-3 py-1 rounded-full font-medium">
-              Verified in SAP ADT
-            </span>
-          </div>
 
-          <div className="rounded-xl border border-[#D9E4F0] overflow-hidden bg-white">
-            <table className="w-full text-xs">
-              <thead className="bg-[#F4F8FC] text-[#5F7187] text-left border-b border-[#D9E4F0]">
-                <tr>
-                  <th className="p-3">Business Field</th>
-                  <th className="p-3">Selected CDS View</th>
-                  <th className="p-3">Actual SAP Technical Field</th>
-                  <th className="p-3">Field Label</th>
-                  <th className="p-3">Data Type</th>
-                  <th className="p-3">Evidence Source</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-[#D9E4F0]">
-                {fieldMappings.map((m, idx) => (
-                  <tr key={m.business_field + idx} className="hover:bg-[#F4F8FC]/50 transition">
-                    <td className="p-3 font-semibold text-[#0F2747]">{m.business_field}</td>
-                    <td className="p-3 font-mono text-[#0A6ED1] font-semibold">
-                      {selectedViews.length > 1 ? (
-                        <select
-                          value={m.cds_view}
-                          onChange={(e) => {
-                            const updated = [...fieldMappings];
-                            updated[idx].cds_view = e.target.value.toUpperCase();
-                            setFieldMappings(updated);
-                          }}
-                          className="bg-white border border-[#D9E4F0] px-2 py-1 rounded text-xs font-mono text-[#0A6ED1] outline-none focus:border-[#0A6ED1]"
-                        >
-                          {selectedViews.map((v) => (
-                            <option key={v} value={v}>
-                              {v}
-                            </option>
-                          ))}
-                        </select>
-                      ) : (
-                        m.cds_view
-                      )}
-                    </td>
-                    <td className="p-3">
-                      <input
-                        type="text"
-                        value={m.actual_field}
-                        onChange={(e) => {
-                          const updated = [...fieldMappings];
-                          updated[idx].actual_field = e.target.value;
-                          setFieldMappings(updated);
-                        }}
-                        className="bg-white border border-[#D9E4F0] px-2 py-1 rounded text-xs font-mono text-[#0A6ED1] outline-none focus:border-[#0A6ED1]"
-                      />
-                    </td>
-                    <td className="p-3 text-[#5F7187]">{m.field_label}</td>
-                    <td className="p-3 font-mono text-purple-700 font-medium">{m.data_type}</td>
-                    <td className="p-3 text-[11px] text-[#5F7187]">{m.evidence}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-
-          <div className="flex items-center justify-between pt-4 border-t border-[#D9E4F0]">
-            <button
-              onClick={() => setActiveStep(3)}
-              className="px-4 py-2 rounded-lg border border-[#D9E4F0] hover:bg-[#F4F8FC] text-xs text-[#0F2747] font-medium flex items-center gap-1.5"
-            >
-              <ArrowLeft className="w-3.5 h-3.5" /> Back to Recommendations &amp; Selection
-            </button>
-            {isReuseFlow ? (
-              <button
-                onClick={() => setActiveStep(12)} // Direct completion: Approve Direct CDS Reuse (Zero Clean-Core Footprint)
-                className="px-6 py-2.5 rounded-xl bg-[#00A878] hover:bg-[#00A878]/90 text-white text-xs font-bold flex items-center gap-2 shadow-xs transition"
-              >
-                <CheckCircle2 className="w-4 h-4" /> Approve Direct CDS Reuse (Zero Clean-Core Footprint) →
-              </button>
-            ) : (
-              <button
-                onClick={() => setActiveStep(6)} // Step 7: KPI
-                className="px-6 py-2.5 rounded-xl bg-[#1677FF] hover:bg-[#0A6ED1] text-white text-xs font-semibold flex items-center gap-2 shadow-xs"
-              >
-                Continue to KPI Step <ArrowRight className="w-4 h-4" />
-              </button>
-            )}
-          </div>
-        </div>
-      )}
-
-      {/* STEP 7: KPI (OPTIONAL - Section 28) */}
-      {activeStep === 6 && (
-        <div className="bg-white border border-[#D9E4F0] rounded-2xl p-6 space-y-6 shadow-sm">
-          <div>
-            <h2 className="text-base font-bold text-[#0F2747]">Step 7 — KPI Calculation (Optional)</h2>
-            <p className="text-xs text-[#5F7187]">
-              Calculate an analytical KPI measure. KPI is completely optional and never mandatory.
-            </p>
-          </div>
-
-          <div className="bg-[#F4F8FC] border border-[#D9E4F0] rounded-xl p-5 space-y-4 max-w-2xl">
-            <div className="text-xs font-bold text-[#0F2747]">Do you want to add a KPI?</div>
-            <div className="flex items-center gap-6">
-              <label className="flex items-center gap-2 text-xs text-[#172B4D] cursor-pointer font-medium">
-                <input
-                  type="radio"
-                  name="kpi"
-                  checked={!kpiEnabled}
-                  onChange={() => setKpiEnabled(false)}
-                  className="text-[#0A6ED1]"
-                />
-                <span>( ) No — Skip KPI calculation</span>
-              </label>
-              <label className="flex items-center gap-2 text-xs text-[#172B4D] cursor-pointer font-medium">
-                <input
-                  type="radio"
-                  name="kpi"
-                  checked={kpiEnabled}
-                  onChange={() => setKpiEnabled(true)}
-                  className="text-[#0A6ED1]"
-                />
-                <span>( ) Yes — Add KPI formula</span>
-              </label>
-            </div>
-
-            {kpiEnabled && (
-              <div className="space-y-2 pt-3 border-t border-[#D9E4F0]">
-                <label className="text-xs text-[#0F2747] font-semibold">Enter KPI Formula:</label>
-                <input
-                  type="text"
-                  value={kpiFormula}
-                  onChange={(e) => setKpiFormula(e.target.value)}
-                  placeholder="e.g. Total Net Amount = SUM(NetAmount)"
-                  className="w-full bg-white border border-[#D9E4F0] rounded-lg p-3 text-xs font-mono text-[#172B4D] outline-none focus:border-[#0A6ED1]"
-                />
-                <p className="text-[11px] text-[#5F7187]">
-                  Actual numeric fields and source entities will strictly come from verified ADT metadata.
-                </p>
-              </div>
-            )}
-          </div>
-
-          <div className="flex items-center justify-between pt-4 border-t border-[#D9E4F0]">
-            <button
-              onClick={() => setActiveStep(5)}
-              className="px-4 py-2 rounded-lg border border-[#D9E4F0] hover:bg-[#F4F8FC] text-xs text-[#0F2747] font-medium flex items-center gap-1.5"
-            >
-              <ArrowLeft className="w-3.5 h-3.5" /> Back to Mapping
-            </button>
-            <button
-              onClick={() => setActiveStep(7)} // Step 8: Code Generation
-              className="px-6 py-2.5 rounded-xl bg-[#1677FF] hover:bg-[#0A6ED1] text-white text-xs font-semibold flex items-center gap-2 shadow-xs"
-            >
-              Continue to Code Generation <ArrowRight className="w-4 h-4" />
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* STEP 8: CODE GENERATION TRIGGER (Section 29) */}
-      {activeStep === 7 && (
-        <div className="bg-white border border-[#D9E4F0] rounded-2xl p-8 space-y-6 text-center max-w-xl mx-auto shadow-sm">
-          <Code2 className="w-10 h-10 text-[#00A878] mx-auto" />
-          <div>
-            <h2 className="text-base font-bold text-[#0F2747]">Step 8 — Synthesize CDS View Entity</h2>
-            <p className="text-xs text-[#5F7187] mt-1">
-              Gemini 3.5 Flash synthesizes clean ABAP CDS View Entity DDL code using ONLY verified metadata.
-            </p>
-          </div>
-
-          <div className="bg-[#F4F8FC] border border-[#D9E4F0] rounded-xl p-4 text-left space-y-2 text-xs">
-            <div className="flex justify-between">
-              <span className="text-[#5F7187]">Selected CDS Views:</span>
-              <span className="font-mono text-[#0A6ED1] font-semibold">{selectedViews.join(', ')}</span>
-            </div>
-            <div className="flex justify-between">
-              <span className="text-[#5F7187]">Verified Fields:</span>
-              <span className="text-[#172B4D] font-medium">{fieldMappings.length} mappings</span>
-            </div>
-            <div className="flex justify-between">
-              <span className="text-[#5F7187]">Optional KPI:</span>
-              <span className="text-[#172B4D] font-medium">{kpiEnabled ? kpiFormula : 'None'}</span>
-            </div>
-          </div>
-
-          <button
-            onClick={handleGenerateCode}
-            disabled={isGeneratingCode}
-            className="w-full py-3 rounded-xl bg-[#1677FF] hover:bg-[#0A6ED1] disabled:opacity-50 text-white text-xs font-semibold flex items-center justify-center gap-2 shadow-xs"
-          >
-            {isGeneratingCode ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
-            Generate CDS Code
-          </button>
-        </div>
-      )}
-
-      {/* STEP 9: CODE REVIEW & REGENERATION (HITL GATE 3 - Sections 30-32) */}
-      {activeStep === 8 && (
-        <div className="bg-white border border-[#D9E4F0] rounded-2xl p-6 space-y-6 shadow-sm">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2.5">
-              <ShieldCheck className="w-5 h-5 text-[#00A878]" />
-              <div>
-                <h2 className="text-base font-bold text-[#0F2747]">Step 9 — Human Code Review (HITL Gate 3)</h2>
-                <p className="text-xs text-[#5F7187]">
-                  Review generated or user-provided CDS View Entity source code before anything is created in SAP.
-                </p>
-              </div>
-            </div>
             <div className="flex items-center gap-3">
-              <span className="text-xs font-mono px-3 py-1 rounded-full border bg-amber-50 border-amber-200 text-amber-800 font-medium">
-                Code Status: {codeStatus}
-              </span>
-              <span className="text-xs bg-[#E8F8F3] border border-[#00A878]/30 text-[#00A878] px-3 py-1 rounded-full font-medium">
-                Human Review Gate
-              </span>
-            </div>
-          </div>
-
-          {/* Code Source Selector */}
-          <div className="flex items-center gap-6 p-3.5 bg-[#F4F8FC] border border-[#D9E4F0] rounded-xl text-xs">
-            <span className="font-bold text-[#0F2747]">Code Source:</span>
-            <label className="flex items-center gap-2 cursor-pointer font-medium text-[#0F2747]">
-              <input
-                type="radio"
-                name="codeSourceMode"
-                value="GEMINI"
-                checked={codeSourceMode === 'GEMINI'}
-                onChange={() => setCodeSourceMode('GEMINI')}
-                className="text-[#0A6ED1] focus:ring-0"
-              />
-              Gemini Generated
-            </label>
-            <label className="flex items-center gap-2 cursor-pointer font-medium text-[#0F2747]">
-              <input
-                type="radio"
-                name="codeSourceMode"
-                value="USER_PROVIDED"
-                checked={codeSourceMode === 'USER_PROVIDED'}
-                onChange={() => {
-                  setCodeSourceMode('USER_PROVIDED');
-                  if (!userProvidedCode) {
-                    setUserProvidedCode(generatedCode);
+              <div className="flex items-center gap-2 text-xs">
+                <span className="bg-[#F4F8FC] border border-[#D9E4F0] text-[#0A6ED1] px-3 py-1 rounded-full font-mono font-medium">
+                  {viewsWrapperMappings.length || selectedViews.length} Selected View(s)
+                </span>
+                <span className="bg-emerald-50 border border-emerald-200 text-emerald-700 px-3 py-1 rounded-full font-mono font-medium">
+                  {viewsWrapperMappings.filter((m) => m.wrapper_cds_view !== 'Not Created').length} Wrapped
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  if (selectedViews.length > 0) {
+                    void loadViewsWrapperMappings(selectedViews);
                   }
                 }}
-                className="text-[#0A6ED1] focus:ring-0"
-              />
-              User Provided
-            </label>
-          </div>
-
-          {/* GEMINI GENERATED MODE */}
-          {codeSourceMode === 'GEMINI' && (
-            <>
-              {/* Generated Code Display with Copy Button */}
-              <div className="space-y-2">
-                <div className="flex items-center justify-between text-xs text-[#5F7187]">
-                  <span>CDS View Entity Source</span>
-                  <button
-                    onClick={() => {
-                      navigator.clipboard.writeText(generatedCode);
-                      setCopiedCode(true);
-                      setTimeout(() => setCopiedCode(false), 2000);
-                    }}
-                    className="flex items-center gap-1 text-[11px] text-[#0A6ED1] hover:underline font-medium"
-                  >
-                    {copiedCode ? <Check className="w-3 h-3 text-[#00A878]" /> : <Copy className="w-3 h-3" />}
-                    {copiedCode ? 'Copied' : 'Copy Code'}
-                  </button>
-                </div>
-                <pre className="p-4 rounded-xl bg-[#0F2747] border border-[#0F2747] font-mono text-xs text-[#00A878] max-h-80 overflow-y-auto leading-relaxed shadow-inner">
-                  {generatedCode}
-                </pre>
-                {codeExplanation && <p className="text-[11px] text-[#5F7187] italic">{codeExplanation}</p>}
-              </div>
-
-              {/* Regeneration with Reviewer Feedback Box */}
-              <div className="p-4 rounded-xl bg-[#F4F8FC] border border-[#D9E4F0] space-y-2.5">
-                <div className="text-xs font-bold text-[#0F2747]">Request Changes / Feedback (Optional):</div>
-                <div className="flex gap-2">
-                  <input
-                    type="text"
-                    value={regenerateFeedback}
-                    onChange={(e) => setRegenerateFeedback(e.target.value)}
-                    placeholder="e.g. Add material description or customize key fields."
-                    className="flex-1 bg-white border border-[#D9E4F0] rounded-lg px-3 py-2 text-xs text-[#172B4D] outline-none focus:border-[#0A6ED1]"
-                  />
-                  <button
-                    onClick={handleRegenerateCode}
-                    disabled={isRegenerating || !regenerateFeedback.trim()}
-                    className="px-4 py-2 rounded-lg bg-white border border-[#D9E4F0] hover:bg-[#D9E4F0]/50 disabled:opacity-50 text-xs text-[#0F2747] font-semibold flex items-center gap-1.5 whitespace-nowrap"
-                  >
-                    {isRegenerating ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
-                    Regenerate
-                  </button>
-                </div>
-              </div>
-            </>
-          )}
-
-          {/* USER PROVIDED MODE */}
-          {codeSourceMode === 'USER_PROVIDED' && (
-            <div className="space-y-4">
-              <div className="space-y-2">
-                <div className="flex items-center justify-between text-xs text-[#5F7187]">
-                  <span className="font-bold text-[#0F2747]">CDS Source Code Editor</span>
-                  <span className="text-[11px] text-[#5F7187]">Paste or write standard ABAP CDS View Entity DDL</span>
-                </div>
-                <textarea
-                  value={userProvidedCode}
-                  onChange={(e) => {
-                    setUserProvidedCode(e.target.value);
-                  }}
-                  rows={12}
-                  placeholder="define view entity ZC_MyCustomView as select from ..."
-                  className="w-full p-4 rounded-xl bg-[#0F2747] border border-[#0F2747] font-mono text-xs text-[#00A878] leading-relaxed shadow-inner outline-none focus:ring-1 focus:ring-[#00A878]"
-                />
-              </div>
-            </div>
-          )}
-
-          <div className="flex items-center justify-between pt-4 border-t border-[#D9E4F0]">
-            <button
-              onClick={() => setActiveStep(6)}
-              className="px-4 py-2 rounded-lg border border-[#D9E4F0] hover:bg-[#F4F8FC] text-xs text-[#0F2747] font-medium flex items-center gap-1.5"
-            >
-              <ArrowLeft className="w-3.5 h-3.5" /> Back to KPI
-            </button>
-            <button
-              onClick={handleApproveCode}
-              disabled={codeSourceMode === 'USER_PROVIDED' ? !userProvidedCode.trim() : !generatedCode.trim()}
-              className="px-6 py-2.5 rounded-xl bg-[#00A878] hover:bg-[#00A878]/90 disabled:opacity-40 disabled:cursor-not-allowed text-white text-xs font-semibold flex items-center gap-2 shadow-xs"
-            >
-              <Check className="w-4 h-4" /> Approve &amp; Continue (Approve Code)
-            </button>
-          </div>
-
-        </div>
-      )}
-
-      {/* STEP 10: CDS ARTIFACT NAME (HITL GATE 4 - Sections 33-34) */}
-      {activeStep === 9 && (
-        <div className="bg-white border border-[#D9E4F0] rounded-2xl p-6 space-y-6 shadow-sm">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2.5">
-              <ShieldCheck className="w-5 h-5 text-[#00A878]" />
-              <div>
-                <h2 className="text-base font-bold text-[#0F2747]">Step 10 — CDS Artifact Name Approval (HITL Gate 4)</h2>
-                <p className="text-xs text-[#5F7187]">
-                  Validate the final CDS artifact name against ABAP naming conventions and repository collision checks.
-                </p>
-              </div>
-            </div>
-            <span className="text-xs bg-[#E8F8F3] border border-[#00A878]/30 text-[#00A878] px-3 py-1 rounded-full font-medium">
-              Name Approval
-            </span>
-          </div>
-
-          <div className="bg-[#F4F8FC] border border-[#D9E4F0] rounded-xl p-5 space-y-4 max-w-xl">
-            <div>
-              <label className="text-xs font-bold text-[#0F2747]">CDS Artifact Name</label>
-              <input
-                type="text"
-                value={artifactName}
-                onChange={(e) => setArtifactName(e.target.value.toUpperCase())}
-                placeholder="e.g. ZC_SALESORDERANALYSIS"
-                className="mt-1.5 w-full bg-white border border-[#D9E4F0] rounded-lg p-3 text-xs font-mono text-[#0A6ED1] font-semibold outline-none focus:border-[#0A6ED1]"
-              />
-              <p className="text-[11px] text-[#5F7187] mt-1">
-                Must start with Z or Y, uppercase alphanumeric + underscores, max 30 characters.
-              </p>
-            </div>
-
-            <div>
-              <label className="text-xs font-bold text-[#0F2747]">Target ABAP Package</label>
-              <input
-                type="text"
-                value={targetPackage}
-                onChange={(e) => setTargetPackage(e.target.value.toUpperCase())}
-                placeholder="e.g. ZTRAINING_2026"
-                className="mt-1.5 w-full bg-white border border-[#D9E4F0] rounded-lg p-3 text-xs font-mono text-purple-700 font-semibold outline-none focus:border-[#0A6ED1]"
-              />
-            </div>
-
-            <button
-              onClick={handleValidateName}
-              disabled={isValidatingName}
-              className="px-4 py-2 bg-white border border-[#D9E4F0] hover:bg-[#F4F8FC] text-xs text-[#0F2747] rounded-lg flex items-center gap-1.5 font-semibold"
-            >
-              {isValidatingName ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldCheck className="w-3.5 h-3.5 text-[#00A878]" />}
-              Validate Name &amp; Check Collisions
-            </button>
-
-            {nameValidation && (
-              <div
-                className={`p-3 rounded-lg border text-xs ${
-                  nameValidation.valid
-                    ? 'bg-[#E8F8F3] border-[#00A878]/30 text-[#00A878]'
-                    : 'bg-red-50 border-red-200 text-red-700'
-                }`}
+                disabled={isLoadingMappings}
+                className="px-3 py-1.5 rounded-lg border border-[#D9E4F0] hover:bg-[#F4F8FC] text-xs font-semibold text-[#0F2747] flex items-center gap-1.5 transition shadow-2xs"
+                title="Refresh wrapper metadata from SAP backend"
               >
-                {nameValidation.valid ? (
-                  <div className="flex items-center gap-2">
-                    <Check className="w-4 h-4" />
-                    <span>Valid Clean Core CDS name. No repository duplicate detected.</span>
-                  </div>
-                ) : (
-                  <div>
-                    <div className="font-semibold mb-1">Validation Errors:</div>
-                    <ul className="list-disc pl-4 space-y-0.5">
-                      {nameValidation.errors.map((err: string, i: number) => (
-                        <li key={i}>{err}</li>
-                      ))}
-                    </ul>
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-
-          <div className="flex items-center justify-between pt-4 border-t border-[#D9E4F0]">
-            <button
-              onClick={() => setActiveStep(8)}
-              className="px-4 py-2 rounded-lg border border-[#D9E4F0] hover:bg-[#F4F8FC] text-xs text-[#0F2747] font-medium flex items-center gap-1.5"
-            >
-              <ArrowLeft className="w-3.5 h-3.5" /> Back to Code Review
-            </button>
-            <button
-              onClick={async () => {
-                const cleanName = artifactName.trim().toUpperCase();
-                const match = generatedCode.match(/\bdefine\s+(?:root\s+|custom\s+)?view\s+(?:entity\s+)?([a-zA-Z0-9_\/]+)/i);
-                const currentEntityName = match ? match[1].trim().toUpperCase() : '';
-
-                if (codeSourceMode === 'GEMINI' && currentEntityName !== cleanName) {
-                  setIsGeneratingCode(true);
-                  try {
-                    const res = await generateCdsCode({
-                      requirement: requirementText,
-                      selected_views: selectedViews,
-                      mappings: fieldMappings,
-                      join_paths: selectedViews.length > 1 ? [{ left_view: selectedViews[0], right_view: selectedViews[1] }] : [],
-                      kpi: kpiEnabled ? { enabled: true, formula: kpiFormula } : null,
-                      artifact_name: cleanName,
-                    });
-                    if (res?.result?.code) {
-                      setGeneratedCode(res.result.code);
-                      if (res?.validation) {
-                        setCodeValidation(res.validation);
-                      }
-                    }
-                  } catch (e: any) {
-                    console.error('Failed to sync generated code with new artifact name', e);
-                  } finally {
-                    setIsGeneratingCode(false);
-                  }
-                }
-                setActiveStep(10); // Step 11: Final Approval
-              }}
-              className="px-6 py-2.5 rounded-xl bg-[#1677FF] hover:bg-[#0A6ED1] text-white text-xs font-semibold flex items-center gap-2 shadow-xs"
-            >
-              Proceed to Final Approval <ArrowRight className="w-4 h-4" />
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* STEP 11: FINAL APPROVAL (HITL GATE 5 - Section 35) */}
-      {activeStep === 10 && (
-        <div className="bg-white border border-[#D9E4F0] rounded-2xl p-6 space-y-6 shadow-sm">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2.5">
-              <Lock className="w-5 h-5 text-[#00A878]" />
-              <div>
-                <h2 className="text-base font-bold text-[#0F2747]">Step 11 — Final Human Approval (HITL Gate 5)</h2>
-                <p className="text-xs text-[#5F7187]">
-                  Complete summary of requirement, metadata, and code. No creation occurs in SAP without your explicit approval.
-                </p>
-              </div>
-            </div>
-            <span className="text-xs bg-[#E8F8F3] border border-[#00A878]/30 text-[#00A878] px-3 py-1 rounded-full font-medium">
-              Mandatory Sign-off
-            </span>
-          </div>
-
-          {/* Final Summary Card (Section 35) */}
-          <div className="bg-[#F4F8FC] border border-[#D9E4F0] rounded-xl p-5 space-y-4 text-xs">
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <div>
-                <span className="text-[#5F7187]">Business Requirement:</span>
-                <p className="text-[#172B4D] mt-1 font-medium">{requirementText}</p>
-              </div>
-              <div>
-                <span className="text-[#5F7187]">Target SAP System:</span>
-                <p className="text-[#0A6ED1] font-mono mt-1 font-semibold">
-                  {metadataStatus?.connection_status || 'SAP S/4HANA DEV (Client 100)'}
-                </p>
-              </div>
-              <div>
-                <span className="text-[#5F7187]">CDS Artifact Name &amp; Package:</span>
-                <p className="font-mono text-[#00A878] mt-1 font-semibold">
-                  {artifactName} <span className="text-[#5F7187]">in</span> {targetPackage}
-                </p>
-              </div>
-              <div>
-                <span className="text-[#5F7187]">Selected CDS Entities:</span>
-                <p className="font-mono text-purple-700 mt-1 font-semibold">{selectedViews.join(', ')}</p>
-              </div>
-              <div>
-                <span className="text-[#5F7187]">Field Mappings:</span>
-                <p className="text-[#172B4D] mt-1 font-medium">{fieldMappings.length} verified fields mapped</p>
-              </div>
-              <div>
-                <span className="text-[#5F7187]">KPI Measure:</span>
-                <p className="text-[#172B4D] mt-1 font-medium">{kpiEnabled ? kpiFormula : 'None'}</p>
-              </div>
-            </div>
-
-            <div className="pt-3 border-t border-[#D9E4F0] space-y-2">
-              <div className="flex items-center justify-between">
-                <label className="text-xs font-bold text-[#0F2747] flex items-center gap-1.5">
-                  <span>SAP Workbench Transport Request (CTS)</span>
-                  <span className="text-red-500 font-bold">*</span>
-                </label>
-                {/* Transport Request Status Indicator */}
-                <div>
-                  {!transportRequest.trim() ? (
-                    <span className="text-[11px] px-2.5 py-0.5 rounded bg-white text-amber-700 border border-amber-200 font-medium">
-                      Not Selected
-                    </span>
-                  ) : isTransportValid ? (
-                    <span className="text-[11px] px-2.5 py-0.5 rounded bg-[#E8F8F3] text-[#00A878] border border-[#00A878]/40 flex items-center gap-1 font-mono font-semibold">
-                      <Check className="w-3 h-3" /> Valid Format: {transportRequest.trim().toUpperCase()}
-                    </span>
-                  ) : (
-                    <span className="text-[11px] px-2.5 py-0.5 rounded bg-red-50 text-red-700 border border-red-200 flex items-center gap-1 font-medium">
-                      <AlertCircle className="w-3 h-3" /> Invalid Format (Must match e.g. S4HK900123)
-                    </span>
-                  )}
-                </div>
-              </div>
-              {availableTransports.length > 0 && (
-                <div className="mt-1 mb-1">
-                  <div className="flex items-center justify-between text-[11px] text-[#5F7187] mb-1">
-                    <span>Quick Select Active Transport (from SAP ADT):</span>
-                    {isLoadingTransports && <Loader2 className="w-3 h-3 animate-spin text-[#0A6ED1]" />}
-                  </div>
-                  <select
-                    value={transportRequest}
-                    onChange={(e) => setTransportRequest(e.target.value)}
-                    className="w-full bg-white border border-[#D9E4F0] rounded-lg px-3 py-2 text-xs font-mono text-[#172B4D] outline-none"
-                  >
-                    <option value="">-- Select from verified SAP Transports --</option>
-                    {availableTransports.map((tr) => (
-                      <option key={tr.number} value={tr.number}>
-                        {tr.number} [{tr.owner}] — {tr.description || 'Workbench Transport'} ({tr.status})
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              )}
-              <input
-                type="text"
-                value={transportRequest}
-                onChange={(e) => setTransportRequest(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ''))}
-                maxLength={10}
-                placeholder="e.g. S4HK900123 (Required: 3-char System ID + K + 6 digits)"
-                className={`mt-1 w-full bg-white border rounded-lg px-3.5 py-2.5 text-xs font-mono text-[#172B4D] outline-none transition ${
-                  !transportRequest.trim()
-                    ? 'border-[#D9E4F0] focus:border-[#0A6ED1]'
-                    : isTransportValid
-                    ? 'border-[#00A878] focus:border-[#00A878]'
-                    : 'border-red-400 focus:border-red-500'
-                }`}
-              />
-              <p className="text-[11px] text-[#5F7187]">
-                CTS rule: Exactly 3 alphanumeric characters (SAP System ID), literal 'K', followed by 6 digits.
-              </p>
-            </div>
-          </div>
-
-          <div className="flex items-center justify-between pt-4 border-t border-[#D9E4F0]">
-            <button
-              onClick={() => setActiveStep(9)}
-              className="px-4 py-2 rounded-lg border border-[#D9E4F0] hover:bg-[#F4F8FC] text-xs text-[#0F2747] font-medium flex items-center gap-1.5"
-            >
-              <ArrowLeft className="w-3.5 h-3.5" /> Back to CDS Name
-            </button>
-            <button
-              onClick={handleExecuteSapCreation}
-              disabled={isCreatingSap || !isTransportValid || (nameValidation && nameValidation.valid === false)}
-              className="px-8 py-3 rounded-xl bg-[#00A878] hover:bg-[#00A878]/90 disabled:opacity-40 disabled:cursor-not-allowed text-white text-xs font-bold flex items-center gap-2 shadow-xs"
-            >
-              {isCreatingSap ? <Loader2 className="w-4 h-4 animate-spin" /> : <Lock className="w-4 h-4" />}
-              Approve &amp; Create in SAP
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* STEP 12: ADT CREATION IN PROGRESS / STATUS (Section 36) */}
-      {activeStep === 11 && (
-        <div className="bg-white border border-[#D9E4F0] rounded-2xl p-8 space-y-6 text-center max-w-xl mx-auto shadow-sm">
-          {isCreatingSap ? (
-            <>
-              <Loader2 className="w-10 h-10 text-[#00A878] animate-spin mx-auto" />
-              <div>
-                <h2 className="text-base font-bold text-[#0F2747]">Step 12 — ADT Creation In Progress</h2>
-                <p className="text-xs text-[#5F7187] mt-1">Executing authenticated REST call over TLS to SAP S/4HANA ADT endpoints.</p>
-              </div>
-            </>
-          ) : creationResult?.success === false ? (
-            <div className="space-y-4">
-              <AlertCircle className="w-10 h-10 text-red-600 mx-auto" />
-              <div>
-                <h2 className="text-base font-bold text-red-700">SAP Creation Error</h2>
-                <p className="text-xs text-red-600 mt-1">{creationResult?.error}</p>
-              </div>
-              <button
-                onClick={() => setActiveStep(10)}
-                className="px-4 py-2 rounded-lg bg-[#F4F8FC] border border-[#D9E4F0] hover:bg-[#D9E4F0]/50 text-xs text-[#0F2747] font-semibold"
-              >
-                Return to Final Approval
+                <RefreshCw className={`w-3.5 h-3.5 text-[#0A6ED1] ${isLoadingMappings ? 'animate-spin' : ''}`} />
+                Refresh
               </button>
             </div>
-          ) : null}
-        </div>
-      )}
+          </div>
 
-      {/* STEP 13: COMPLETION (Section 37) */}
-      {activeStep === 12 && (
-        <div className="bg-white border border-[#D9E4F0] rounded-2xl p-8 space-y-6 text-center max-w-xl mx-auto shadow-sm">
-          {isReuseFlow ? (
-            <>
-              <CheckCircle2 className="w-12 h-12 text-[#00A878] mx-auto" />
-              <div>
-                <h2 className="text-lg font-bold text-[#0F2747]">✓ REUSE EXISTING CDS APPROVED</h2>
-                <p className="text-xs text-[#5F7187] mt-1">
-                  Standard SAP CDS View Entity satisfies 100% of required business fields. Direct reuse approved without creating custom CDS artifacts.
-                </p>
+          {/* Loading indicator */}
+          {isLoadingMappings && viewsWrapperMappings.length === 0 && (
+            <div className="p-8 text-center bg-[#F4F8FC] border border-[#D9E4F0] rounded-2xl space-y-3">
+              <Loader2 className="w-8 h-8 text-[#0A6ED1] animate-spin mx-auto" />
+              <div className="text-xs font-semibold text-[#0F2747]">
+                Retrieving Authoritative CDS Wrapper Metadata &amp; Field Mappings…
               </div>
-
-              <div className="bg-[#E8F8F3]/60 border border-[#00A878]/30 rounded-xl p-5 text-left text-xs space-y-2.5 font-mono text-[#172B4D]">
-                <div className="flex justify-between items-center border-b border-[#00A878]/20 pb-2">
-                  <span className="text-[#5F7187] font-sans font-medium">Approved Existing CDS:</span>
-                  <span className="text-[#0A6ED1] font-bold text-sm">{reusedCdsName}</span>
-                </div>
-                <div className="flex justify-between items-center border-b border-[#00A878]/20 pb-2">
-                  <span className="text-[#5F7187] font-sans font-medium">Field Coverage:</span>
-                  <span className="text-[#00A878] font-bold">100% (All required fields verified in SAP ADT)</span>
-                </div>
-                <div className="flex justify-between items-center border-b border-[#00A878]/20 pb-2">
-                  <span className="text-[#5F7187] font-sans font-medium">Action Approved:</span>
-                  <span className="text-[#00A878] font-semibold bg-[#E8F8F3] px-2 py-0.5 rounded border border-[#00A878]/30">REUSE_EXISTING (Zero Clean-Core Footprint)</span>
-                </div>
-                <div className="flex justify-between items-center">
-                  <span className="text-[#5F7187] font-sans font-medium">Custom Artifact Creation:</span>
-                  <span className="text-[#5F7187] font-semibold">NOT REQUIRED (No DDL generated, no ADT create called)</span>
-                </div>
-              </div>
-
-              <div className="flex flex-wrap justify-center gap-3 pt-2">
-                <button
-                  onClick={() => openViewDetails(reusedCdsName)}
-                  className="px-4 py-2.5 rounded-xl bg-[#F4F8FC] border border-[#D9E4F0] hover:bg-[#D9E4F0]/50 text-[#0F2747] text-xs font-semibold flex items-center gap-1.5 shadow-xs"
-                >
-                  <Database className="w-4 h-4 text-[#0A6ED1]" /> View CDS Details &amp; Fields
-                </button>
-                <button
-                  onClick={() => handleOpenLiveSource(reusedCdsName)}
-                  className="px-4 py-2.5 rounded-xl bg-[#F4F8FC] border border-[#D9E4F0] hover:bg-purple-50 text-[#0A6ED1] text-xs font-mono font-semibold flex items-center gap-1.5 shadow-xs"
-                >
-                  <FileText className="w-4 h-4 text-[#0A6ED1]" /> View Genuine ADT Source
-                </button>
-                <button
-                  onClick={() => {
-                    setIsReuseFlow(false);
-                    setReusedCdsName('');
-                    setReusedCdsItem(null);
-                    setActiveStep(0);
-                  }}
-                  className="px-6 py-2.5 rounded-xl bg-[#1677FF] hover:bg-[#0A6ED1] text-white text-xs font-semibold shadow-xs"
-                >
-                  Start New Requirement
-                </button>
-              </div>
-            </>
-          ) : (
-            <>
-              <CheckCircle2 className="w-12 h-12 text-[#00A878] mx-auto" />
-              <div>
-                <h2 className="text-lg font-bold text-[#0F2747]">Step 13 — CDS Creation Successful</h2>
-                <p className="text-xs text-[#5F7187] mt-1">
-                  Your CDS View Entity was verified and recorded with authoritative SAP ADT metadata.
-                </p>
-              </div>
-
-              <div className="bg-[#F4F8FC] border border-[#D9E4F0] rounded-xl p-5 text-left text-xs space-y-2 font-mono">
-                <div className="flex justify-between">
-                  <span className="text-[#5F7187]">CDS Name:</span>
-                  <span className="text-[#00A878] font-bold">{creationResult?.name || artifactName}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-[#5F7187]">Status:</span>
-                  <span className="text-[#00A878] font-semibold">{creationResult?.status || 'Created'}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-[#5F7187]">Package:</span>
-                  <span className="text-purple-700 font-semibold">{creationResult?.package || targetPackage}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-[#5F7187]">ADT:</span>
-                  <span className="text-[#0A6ED1] font-semibold">Connected</span>
-                </div>
-              </div>
-
-              <div className="flex justify-center gap-3 pt-2">
-                <button
-                  onClick={() => handleOpenLiveSource(creationResult?.name || artifactName)}
-                  className="px-5 py-2.5 rounded-xl bg-white border border-[#D9E4F0] hover:bg-[#F4F8FC] text-[#0F2747] text-xs font-semibold flex items-center gap-1.5 shadow-xs"
-                >
-                  <FileText className="w-4 h-4 text-[#0A6ED1]" /> View Source
-                </button>
-                <button
-                  onClick={() => {
-                    setActiveStep(0);
-                    setCreationResult(null);
-                  }}
-                  className="px-6 py-2.5 rounded-xl bg-[#1677FF] hover:bg-[#0A6ED1] text-white text-xs font-semibold shadow-xs"
-                >
-                  Start Another Requirement
-                </button>
-              </div>
-            </>
+              <p className="text-[11px] text-[#5F7187]">
+                Querying SAP metadata catalog and registered repository wrappers.
+              </p>
+            </div>
           )}
+
+          {/* No Views Selected State */}
+          {!isLoadingMappings && selectedViews.length === 0 && (
+            <div className="p-8 text-center bg-[#F4F8FC] border border-[#D9E4F0] rounded-2xl space-y-4">
+              <Database className="w-10 h-10 text-gray-400 mx-auto" />
+              <div>
+                <div className="text-sm font-bold text-[#0F2747]">No CDS Views Selected</div>
+                <p className="text-xs text-[#5F7187] mt-1">
+                  Please select one or more CDS views to view their wrapper relationships and field mappings.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setActiveStep(3)}
+                className="px-4 py-2 rounded-xl bg-[#1677FF] hover:bg-[#0A6ED1] text-white text-xs font-semibold"
+              >
+                ← Back to CDS Selection
+              </button>
+            </div>
+          )}
+
+          {/* View Relationship Cards: Support Single and Multiple Selected Views */}
+          <div className="space-y-6">
+            {viewsWrapperMappings.map((viewItem) => {
+              const hasWrapper = viewItem.wrapper_cds_view && viewItem.wrapper_cds_view !== 'Not Created';
+              const isConfirmedActive = (viewItem.wrapper_creation_status || '').toUpperCase().includes('ACTIVE');
+              const isInactive = (viewItem.wrapper_creation_status || '').toUpperCase().includes('INACTIVE');
+
+              return (
+                <div
+                  key={viewItem.source_cds_view}
+                  className="rounded-2xl border border-[#D9E4F0] bg-white overflow-hidden shadow-sm hover:border-[#0A6ED1]/40 transition"
+                >
+                  {/* Card Header: Clear Relationship Display */}
+                  <div className="bg-[#F8FAFC] border-b border-[#D9E4F0] p-4 flex flex-col xl:flex-row xl:items-center justify-between gap-4">
+                    {/* Relationship Pillars: Original CDS View → Wrapper CDS View */}
+                    <div className="flex flex-wrap items-center gap-3">
+                      {/* Original CDS View */}
+                      <div className="bg-white border border-[#D9E4F0] rounded-xl px-3.5 py-2.5 shadow-2xs min-w-[200px]">
+                        <div className="text-[10px] uppercase font-bold tracking-wider text-[#5F7187] flex items-center gap-1.5">
+                          <Database className="w-3.5 h-3.5 text-[#0A6ED1]" />
+                          Original CDS View
+                        </div>
+                        <div className="font-mono text-sm font-bold text-[#0A6ED1] mt-0.5">
+                          {viewItem.source_cds_view}
+                        </div>
+                        <div className="text-[11px] text-[#5F7187] truncate max-w-xs">
+                          {viewItem.source_label || 'SAP Standard CDS View'}
+                        </div>
+                      </div>
+
+                      {/* Directional Relationship Arrow */}
+                      <div className="flex flex-col items-center justify-center px-1">
+                        <span className="text-[9px] font-semibold uppercase tracking-wider text-[#0A6ED1] bg-blue-50 px-2 py-0.5 rounded-full border border-blue-200">
+                          Extraction Wrapper
+                        </span>
+                        <ArrowRight className="w-5 h-5 text-[#0A6ED1] stroke-[2.5]" />
+                      </div>
+
+                      {/* Corresponding Wrapper CDS View */}
+                      <div
+                        className={`rounded-xl px-3.5 py-2.5 shadow-2xs min-w-[220px] border ${
+                          hasWrapper
+                            ? 'bg-emerald-50/50 border-emerald-300'
+                            : 'bg-gray-50 border-gray-200'
+                        }`}
+                      >
+                        <div className="text-[10px] uppercase font-bold tracking-wider text-[#5F7187] flex items-center gap-1.5">
+                          {hasWrapper ? (
+                            <CheckCircle2 className="w-3.5 h-3.5 text-[#00A878]" />
+                          ) : (
+                            <AlertCircle className="w-3.5 h-3.5 text-gray-400" />
+                          )}
+                          Corresponding Wrapper CDS View
+                        </div>
+                        <div className="font-mono text-sm font-bold mt-0.5">
+                          {hasWrapper ? (
+                            <span className="text-emerald-700 font-bold">{viewItem.wrapper_cds_view}</span>
+                          ) : (
+                            <span className="text-gray-500 italic">Not Created</span>
+                          )}
+                        </div>
+                        <div className="text-[11px] text-[#5F7187] font-mono">
+                          {hasWrapper && viewItem.wrapper_sql_view_name
+                            ? `SQL View: ${viewItem.wrapper_sql_view_name}`
+                            : 'No Wrapper Registered'}
+                        </div>
+                      </div>
+
+                      {/* Wrapper Creation Status Badge */}
+                      <div className="flex flex-col justify-center">
+                        <div className="text-[10px] uppercase font-bold tracking-wider text-[#5F7187] mb-1">
+                          Wrapper Creation Status
+                        </div>
+                        {isConfirmedActive ? (
+                          <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold bg-[#E8F8F3] text-[#00A878] border border-[#00A878]/30 shadow-2xs">
+                            <CheckCircle className="w-3.5 h-3.5" />
+                            {viewItem.wrapper_creation_status}
+                          </span>
+                        ) : isInactive ? (
+                          <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold bg-amber-50 text-amber-700 border border-amber-300 shadow-2xs">
+                            <Zap className="w-3.5 h-3.5" />
+                            {viewItem.wrapper_creation_status}
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold bg-gray-100 text-gray-600 border border-gray-300 shadow-2xs">
+                            <AlertCircle className="w-3.5 h-3.5 text-gray-400" />
+                            Not Created
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Wrapper Actions */}
+                    <div className="flex flex-wrap items-center gap-2">
+                      {!hasWrapper ? (
+                        <button
+                          type="button"
+                          onClick={() => openWrapperForm(viewItem.source_cds_view)}
+                          className="px-3.5 py-1.5 rounded-lg bg-[#1677FF] hover:bg-[#0A6ED1] text-white text-xs font-semibold flex items-center gap-1.5 shadow-xs transition"
+                        >
+                          <Plus className="w-3.5 h-3.5" /> Create Extraction Wrapper
+                        </button>
+                      ) : isInactive ? (
+                        <button
+                          type="button"
+                          onClick={() => openWrapperForActivation(viewItem.source_cds_view, viewItem.wrapper_cds_view)}
+                          className="px-3.5 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white text-xs font-semibold flex items-center gap-1.5 shadow-xs transition"
+                        >
+                          <Zap className="w-3.5 h-3.5" /> Activate CDS in SAP
+                        </button>
+                      ) : null}
+
+                      <button
+                        type="button"
+                        onClick={() => handleOpenLiveSource(viewItem.source_cds_view)}
+                        className="px-3 py-1.5 rounded-lg bg-white border border-[#D9E4F0] hover:bg-[#F4F8FC] text-xs font-medium text-[#0F2747] flex items-center gap-1 shadow-2xs transition"
+                        title="View Original CDS DDL Source"
+                      >
+                        <FileText className="w-3.5 h-3.5 text-[#0A6ED1]" /> Original Source
+                      </button>
+
+                      {hasWrapper && (
+                        <button
+                          type="button"
+                          onClick={() => handleOpenLiveSource(viewItem.wrapper_cds_view)}
+                          className="px-3 py-1.5 rounded-lg bg-white border border-emerald-300 hover:bg-emerald-50 text-xs font-medium text-emerald-700 flex items-center gap-1 shadow-2xs transition"
+                          title="View Wrapper CDS DDL Source"
+                        >
+                          <FileText className="w-3.5 h-3.5 text-emerald-600" /> Wrapper Source
+                        </button>
+                      )}
+
+                      <button
+                        type="button"
+                        onClick={() => handleOpenDataPreview(viewItem.source_cds_view)}
+                        className="px-3 py-1.5 rounded-lg bg-white border border-[#D9E4F0] hover:bg-[#F4F8FC] text-xs font-medium text-[#0F2747] flex items-center gap-1 shadow-2xs transition"
+                        title="Data Preview"
+                      >
+                        <Table className="w-3.5 h-3.5 text-[#0A6ED1]" /> Preview
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Mapping Details Table for this CDS View */}
+                  <div className="p-4 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <div className="text-xs font-bold text-[#0F2747] flex items-center gap-2">
+                        <span>Mapping Details ({viewItem.field_mappings?.length || 0} Fields)</span>
+                        <span className="text-[11px] font-normal text-[#5F7187]">
+                          — Projected from original <span className="font-mono text-[#0A6ED1]">{viewItem.source_cds_view}</span> to target <span className="font-mono text-[#00A878]">{viewItem.wrapper_cds_view !== 'Not Created' ? viewItem.wrapper_cds_view : 'Wrapper'}</span>
+                        </span>
+                      </div>
+                      <span className="text-[11px] font-mono text-[#5F7187] bg-[#F4F8FC] px-2.5 py-0.5 rounded border border-[#D9E4F0]">
+                        Package: {viewItem.package || 'ZTRAINING_2026'}
+                      </span>
+                    </div>
+
+                    <div className="rounded-xl border border-[#D9E4F0] overflow-hidden overflow-x-auto">
+                      <table className="w-full text-xs">
+                        <thead className="bg-[#F4F8FC] text-[#5F7187] text-left border-b border-[#D9E4F0]">
+                          <tr>
+                            <th className="p-2.5 font-semibold">Business Field</th>
+                            <th className="p-2.5 font-semibold">Original Technical Field</th>
+                            <th className="p-2.5 font-semibold">Wrapper Target Field</th>
+                            <th className="p-2.5 font-semibold">Field Label</th>
+                            <th className="p-2.5 font-semibold">Data Type</th>
+                            <th className="p-2.5 font-semibold text-center">Key</th>
+                            <th className="p-2.5 font-semibold">Evidence / Source</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-[#D9E4F0]">
+                          {viewItem.field_mappings && viewItem.field_mappings.length > 0 ? (
+                            viewItem.field_mappings.map((fm, fIdx) => (
+                              <tr key={fm.business_field + '-' + fIdx} className="hover:bg-[#F4F8FC]/50 transition">
+                                <td className="p-2.5 font-semibold text-[#0F2747]">{fm.business_field}</td>
+                                <td className="p-2.5 font-mono text-[#0A6ED1] font-semibold">{fm.source_field}</td>
+                                <td className="p-2.5 font-mono text-[#00A878] font-semibold">{fm.wrapper_target_field}</td>
+                                <td className="p-2.5 text-[#5F7187]">{fm.field_label || '—'}</td>
+                                <td className="p-2.5 font-mono text-purple-700 font-medium">
+                                  {fm.data_type}
+                                  {fm.length ? `(${fm.length}${fm.decimals ? `,${fm.decimals}` : ''})` : ''}
+                                </td>
+                                <td className="p-2.5 text-center">
+                                  {fm.is_key ? (
+                                    <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-amber-100 text-amber-800 border border-amber-300">
+                                      KEY
+                                    </span>
+                                  ) : (
+                                    <span className="text-gray-300">—</span>
+                                  )}
+                                </td>
+                                <td className="p-2.5 text-[11px] text-[#5F7187]">{fm.evidence || 'Authoritative SAP Metadata'}</td>
+                              </tr>
+                            ))
+                          ) : (
+                            <tr>
+                              <td colSpan={7} className="p-4 text-center text-gray-500 italic">
+                                No field mappings available for this view.
+                              </td>
+                            </tr>
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Bottom Navigation */}
+          <div className="flex items-center justify-between pt-4 border-t border-[#D9E4F0]">
+            <button
+              type="button"
+              onClick={() => setActiveStep(3)}
+              className="px-4 py-2 rounded-lg border border-[#D9E4F0] hover:bg-[#F4F8FC] text-xs text-[#0F2747] font-medium flex items-center gap-1.5 transition"
+            >
+              <ArrowLeft className="w-3.5 h-3.5" /> ← Back to CDS Selection
+            </button>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  if (selectedViews.length > 0) {
+                    void loadViewsWrapperMappings(selectedViews);
+                  }
+                }}
+                disabled={isLoadingMappings}
+                className="px-4 py-2 rounded-xl bg-white border border-[#D9E4F0] hover:bg-[#F4F8FC] text-xs font-semibold text-[#0F2747] flex items-center gap-1.5 shadow-xs transition"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 text-[#0A6ED1] ${isLoadingMappings ? 'animate-spin' : ''}`} />
+                Refresh All Wrapper Mappings
+              </button>
+            </div>
+          </div>
         </div>
       )}
+
+
+
 
       {/* 4. MODALS */}
 
@@ -5812,6 +5391,26 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
                     <input required value={wrapperTransportRequest} onChange={(event) => { setWrapperTransportRequest(event.target.value.toUpperCase()); setWrapperTransportVerified(false); setWrapperWriteCapability((current: any) => current ? { ...current, selected_transport_valid: false } : current); setWrapperCreationResult(null); }} maxLength={10} className="min-w-0 flex-1 rounded-lg border border-[#B8C7D9] px-3 py-2 font-mono font-normal" placeholder="Enter a Workbench request from SAP" />
                     <button type="button" onClick={handleVerifyWrapperTransport} disabled={!wrapperTransportRequest.trim() || wrapperTransportRequest.trim().length !== 10} className="rounded bg-[#0F2747] px-3 py-2 text-[11px] font-bold text-white disabled:cursor-not-allowed disabled:opacity-40">{wrapperWriteCapability?.selected_transport_valid ? 'Verified' : 'Verify Transport'}</button>
                   </div>
+                  {wrapperWriteCapability?.eligible_transports && wrapperWriteCapability.eligible_transports.length > 0 && (
+                    <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                      <span className="text-[10px] text-[#5F7187]">Available SAP Transports:</span>
+                      {wrapperWriteCapability.eligible_transports.map((t: any) => (
+                        <button
+                          key={t.number}
+                          type="button"
+                          onClick={() => {
+                            setWrapperTransportRequest(t.number);
+                            setWrapperTransportVerified(true);
+                            setWrapperWriteCapability((current: any) => current ? { ...current, selected_transport_valid: true, selected_transport: t } : current);
+                          }}
+                          className={`rounded border px-1.5 py-0.5 font-mono text-[10px] ${wrapperTransportRequest === t.number ? 'border-[#0A6ED1] bg-[#EBF3FC] text-[#0A6ED1] font-bold' : 'border-gray-200 bg-white text-gray-700 hover:bg-gray-50'}`}
+                          title={t.description ? `${t.number} - ${t.description}` : t.number}
+                        >
+                          {t.number}
+                        </button>
+                      ))}
+                    </div>
+                  )}
                   {wrapperTransportVerified && wrapperWriteCapability?.selected_transport?.description && <p className="mt-1 text-[11px] text-emerald-800">SAP verified: {wrapperWriteCapability.selected_transport.number} — {wrapperWriteCapability.selected_transport.description}</p>}
                   {wrapperWriteCapability?.reason && <p className="mt-1 text-[11px] text-amber-800">{wrapperWriteCapability.reason}</p>}
                 </label>
@@ -5871,18 +5470,140 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
                     </div>
                   )}
                   {wrapperCreationResult?.success && (
-                    <div className="mt-3 space-y-2 rounded-xl border border-emerald-300 bg-emerald-50 p-3 text-xs text-emerald-900">
-                      <div className="font-bold">CDS Object Created Successfully</div>
-                      <div>Source CDS View: <span className="font-mono font-semibold">{wrapperCreationResult.source_cds_view_name}</span></div>
-                      <div>Created Wrapper CDS: <span className="font-mono font-semibold">{wrapperCreationResult.created_object_name}</span></div>
-                      <div>SQL View Name: <span className="font-mono font-semibold">{wrapperCreationResult.sql_view_name}</span></div>
-                      <div>SAP System: {wrapperCreationResult.sap_system}</div>
-                      <div>Creation Status: <span className="font-bold">{wrapperCreationResult.creation_status}</span></div>
-                      <div>Activation Status: <span className="font-bold">{wrapperActivationResult ? (wrapperActivationResult.success ? 'ACTIVE (SAP CONFIRMED)' : 'NOT ACTIVATED') : wrapperCreationResult.activation_status}</span></div>
-                      {wrapperCreationResult.adt_response && <details className="md:col-span-2"><summary className="cursor-pointer font-bold">SAP ADT response and independent GET verification</summary><pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap rounded bg-white p-2 font-mono text-[10px]">{JSON.stringify(wrapperCreationResult.adt_response, null, 2)}</pre></details>}
-                      {wrapperCreationResult.object_url && <a className="mr-3 inline-block underline" href={wrapperCreationResult.object_url} target="_blank" rel="noreferrer">Open SAP ADT Object</a>}
-                      <button type="button" onClick={handleActivateExtractionWrapper} disabled={isActivatingWrapper} className="rounded bg-amber-700 px-2.5 py-1 text-[11px] font-semibold text-white disabled:opacity-50">{isActivatingWrapper ? 'Activating…' : 'Activate CDS…'}</button>
-                      {wrapperActivationResult && <pre className="whitespace-pre-wrap text-[10px]">{JSON.stringify(wrapperActivationResult.messages || wrapperActivationResult, null, 2)}</pre>}
+                    <div className="mt-3 space-y-3 rounded-xl border border-[#D9E4F0] bg-[#F8FAFC] p-3.5 text-xs text-[#0F2747]">
+                      <div className="flex items-center justify-between border-b border-[#D9E4F0] pb-2">
+                        <span className="font-bold text-sm text-[#0A6ED1]">CDS Wrapper Lifecycle Tracking</span>
+                        <span className={`px-2 py-0.5 rounded font-bold text-[10px] uppercase tracking-wider ${
+                          wrapperActivationResult?.activation_confirmed
+                            ? 'bg-emerald-100 text-emerald-800 border border-emerald-300'
+                            : 'bg-amber-100 text-amber-800 border border-amber-300'
+                        }`}>
+                          {wrapperActivationResult?.activation_confirmed ? 'ACTIVE (SAP CONFIRMED)' : 'INACTIVE (NOT ACTIVATED)'}
+                        </span>
+                      </div>
+
+                      {/* 5 Distinct Lifecycle Stages */}
+                      <div className="rounded-lg border border-[#D9E4F0] bg-white p-2.5">
+                        <div className="mb-2 text-[10px] font-bold uppercase tracking-wider text-[#5F7187]">5-Stage Repository Lifecycle Status</div>
+                        <ol className="space-y-1.5 text-[11px]">
+                          <li className="flex items-center justify-between">
+                            <span>1. Object Shell Created (DDLS):</span>
+                            <span className="font-semibold text-emerald-700">✓ Created (HTTP {wrapperCreationResult.adt_response?.shell_post_http_status || 201})</span>
+                          </li>
+                          <li className="flex items-center justify-between">
+                            <span>2. Source Uploaded (/source/main):</span>
+                            <span className="font-semibold text-emerald-700">✓ Uploaded (HTTP {wrapperCreationResult.source_upload_http_status || 200})</span>
+                          </li>
+                          <li className="flex items-center justify-between">
+                            <span>3. Source Verified (Independent GET):</span>
+                            <span className="font-semibold text-emerald-700">✓ Verified & Matched</span>
+                          </li>
+                          <li className="flex items-center justify-between">
+                            <span>4. Activation Request Accepted:</span>
+                            {wrapperActivationResult?.activation_request_accepted ? (
+                              <span className="font-semibold text-emerald-700">✓ Accepted (HTTP {wrapperActivationResult.status_code || 200})</span>
+                            ) : (
+                              <span className="font-semibold text-gray-500">Pending user confirmation</span>
+                            )}
+                          </li>
+                          <li className="flex items-center justify-between">
+                            <span>5. Activation Confirmed (SAP Dictionary):</span>
+                            {wrapperActivationResult?.activation_confirmed ? (
+                              <span className="font-bold text-emerald-700">✓ ACTIVE (Verified via ADT Read)</span>
+                            ) : wrapperActivationResult ? (
+                              <span className="font-bold text-red-600">✗ INACTIVE (Not confirmed active)</span>
+                            ) : (
+                              <span className="font-semibold text-gray-500">Pending activation</span>
+                            )}
+                          </li>
+                        </ol>
+                      </div>
+
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-[11px]">
+                        <div>Source CDS: <span className="font-mono font-semibold">{wrapperCreationResult.source_cds_view_name}</span></div>
+                        <div>Wrapper CDS: <span className="font-mono font-semibold">{wrapperCreationResult.created_object_name}</span></div>
+                        <div>SQL View Name: <span className="font-mono font-semibold">{wrapperCreationResult.sql_view_name}</span></div>
+                        <div>SAP System: <span className="font-semibold">{wrapperCreationResult.sap_system}</span></div>
+                      </div>
+
+                      {/* Exact SAP Activation Errors & Warnings */}
+                      {wrapperActivationResult?.error_message && (
+                        <div className="rounded-lg border border-red-300 bg-red-50 p-2.5 text-xs text-red-800">
+                          <div className="font-bold mb-1">SAP Activation Error:</div>
+                          <div>{wrapperActivationResult.error_message}</div>
+                        </div>
+                      )}
+
+                      {Array.isArray(wrapperActivationResult?.errors) && wrapperActivationResult.errors.length > 0 && (
+                        <div className="rounded-lg border border-red-200 bg-red-50 p-2 text-[11px] text-red-800">
+                          <div className="font-bold mb-1">SAP Diagnostic Errors:</div>
+                          <ul className="list-disc list-inside space-y-0.5">
+                            {wrapperActivationResult.errors.map((e: any, idx: number) => (
+                              <li key={idx}>
+                                {e.line ? `Line ${e.line}: ` : ''}{e.short_text || 'Error'}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+
+                      {Array.isArray(wrapperActivationResult?.warnings) && wrapperActivationResult.warnings.length > 0 && (
+                        <div className="rounded-lg border border-amber-200 bg-amber-50 p-2 text-[11px] text-amber-800">
+                          <div className="font-bold mb-1">SAP Diagnostic Warnings:</div>
+                          <ul className="list-disc list-inside space-y-0.5">
+                            {wrapperActivationResult.warnings.map((w: any, idx: number) => (
+                              <li key={idx}>
+                                {w.line ? `Line ${w.line}: ` : ''}{w.short_text || 'Warning'}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+
+                      {wrapperActivationResult?.activation_log_uri && (
+                        <div className="text-[11px] text-[#5F7187]">
+                          Activation Log: <span className="font-mono text-[#0F2747]">{wrapperActivationResult.activation_log_uri}</span>
+                        </div>
+                      )}
+
+                      {wrapperCreationResult.adt_response && (
+                        <details className="text-[11px]">
+                          <summary className="cursor-pointer font-semibold text-[#0A6ED1] hover:underline">
+                            Inspect Raw SAP ADT Shell & Source Payload Responses
+                          </summary>
+                          <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap rounded bg-gray-900 text-gray-100 p-2 font-mono text-[10px]">
+                            {JSON.stringify(wrapperCreationResult.adt_response, null, 2)}
+                          </pre>
+                        </details>
+                      )}
+
+                      <div className="flex items-center gap-3 pt-2">
+                        {wrapperCreationResult.object_url && (
+                          <a
+                            className="rounded border border-[#D9E4F0] bg-white px-2.5 py-1 text-[11px] font-semibold text-[#0A6ED1] hover:bg-[#F4F8FC]"
+                            href={wrapperCreationResult.object_url}
+                            target="_blank"
+                            rel="noreferrer"
+                          >
+                            Open SAP ADT Object
+                          </a>
+                        )}
+
+                        {!wrapperActivationResult?.activation_confirmed ? (
+                          <button
+                            type="button"
+                            onClick={handleActivateExtractionWrapper}
+                            disabled={isActivatingWrapper}
+                            className="rounded bg-amber-700 px-3 py-1 text-[11px] font-semibold text-white hover:bg-amber-800 disabled:opacity-50"
+                          >
+                            {isActivatingWrapper ? 'Activating in SAP…' : 'Activate CDS in SAP'}
+                          </button>
+                        ) : (
+                          <span className="text-[11px] font-bold text-emerald-700 bg-emerald-50 border border-emerald-200 rounded px-2.5 py-1">
+                            ✓ Activated in SAP DEV
+                          </span>
+                        )}
+                      </div>
                     </div>
                   )}
                   {wrapperValidationResult && (

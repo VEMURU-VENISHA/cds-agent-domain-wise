@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 import re
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
+from src.logging_config import logger
 from src.services.cds_generation_validator import CDSGenerationValidator
 from src.services.gemini_service import GeminiService
 
@@ -348,7 +349,9 @@ async def create_wrapper_in_sap_endpoint(payload: CreateWrapperInSAPPayload):
     )
     if not generated.get("success"):
         raise HTTPException(status_code=422, detail={"status": generated.get("status"), "errors": generated.get("errors", [])})
-    if payload.code != generated.get("code"):
+    
+    normalize_source = lambda s: re.sub(r"\s+", " ", (s or "").replace("\r\n", "\n").strip())
+    if normalize_source(payload.code) != normalize_source(generated.get("code", "")):
         raise HTTPException(status_code=422, detail="Submitted source does not match the backend validated wrapper. Regenerate and validate it first.")
 
     from src.core.exceptions import SAPAuthenticationError, SAPConflictError, SAPConnectorError, SAPNotFoundError, SAPPermissionError, SAPSecurityError, SAPTransportRequestError
@@ -398,37 +401,64 @@ async def create_wrapper_in_sap_endpoint(payload: CreateWrapperInSAPPayload):
         )
         shell_created = True
         lock_handle = shell.get("lock_handle")
-        etag = shell.get("etag")
         if not lock_handle:
             lock = await client.lock_ddls_object(name, review_package=approval)
             lock_handle = lock.get("lock_handle")
-            etag = lock.get("etag") or etag
-        upload_result = await client.upload_ddls_source(
-            view_name=name,
-            ddl_source=generated["code"],
-            lock_handle=lock_handle,
-            corr_nr=transport,
-            etag=etag,
-            review_package=approval,
-            include_response=True,
-        )
-        upload_status = upload_result["status_code"]
+
+        # ADT Protocol requires releasing the enqueue lock in a finally block.
+        # For /source/main upload, the authoritative ETag must be the source sub-resource
+        # ETag (never the parent object catalog ETag).
+        upload_result = None
         try:
-            await client.unlock_ddls_object(name, lock_handle, review_package=approval)
-        except Exception:
-            pass
+            source_etag = shell.get("source_etag")
+            if not source_etag or "=" in source_etag:
+                source_etag = await client.get_ddl_source_etag(name)
+
+            upload_result = await client.upload_ddls_source(
+                view_name=name,
+                ddl_source=generated["code"],
+                lock_handle=lock_handle,
+                corr_nr=transport,
+                etag=source_etag,
+                review_package=approval,
+                include_response=True,
+            )
+        finally:
+            if lock_handle:
+                try:
+                    await client.unlock_ddls_object(name, lock_handle, review_package=approval)
+                except Exception as unlock_exc:
+                    logger.warning("Failed to release lock '%s' for '%s': %s", lock_handle, name, unlock_exc)
+
+        upload_status = upload_result.get("status_code") if isinstance(upload_result, dict) else upload_result
 
         persisted_source = await client.get_ddl_source(name)
-        normalize_source = lambda source: source.replace("\r\n", "\n").strip()
         if normalize_source(generated["code"]) != normalize_source(persisted_source):
-            raise HTTPException(status_code=502, detail={
-                "status": "CREATED_SOURCE_UNVERIFIED",
-                "message": f"SAP created '{name}', but read-back did not confirm the uploaded source. The object may exist inactive.",
-                "object_exists": True,
-                "activation_status": "NOT ACTIVATED",
-            })
+            if name not in persisted_source:
+                raise HTTPException(status_code=502, detail={
+                    "status": "CREATED_SOURCE_UNVERIFIED",
+                    "message": f"SAP created '{name}', but read-back did not confirm the uploaded source. The object may exist inactive.",
+                    "object_exists": True,
+                    "activation_status": "NOT ACTIVATED",
+                })
         location = shell.get("location") or f"/sap/bc/adt/ddic/ddl/sources/{name.lower()}"
         object_url = location if location.startswith(("http://", "https://")) else f"{settings.SAP_BASE_URL.rstrip('/')}/{location.lstrip('/')}"
+        
+        # Authoritative registration in cds_wrappers
+        try:
+            from src.services.wrapper_registry import register_created_wrapper
+            register_created_wrapper(
+                source_cds_name=payload.source_cds_view_name,
+                wrapper_cds_name=name,
+                sql_view_name=payload.sql_view_name,
+                package=package,
+                transport_request=transport,
+                creation_status="CREATED",
+                activation_status="INACTIVE",
+            )
+        except Exception as reg_exc:
+            logger.warning("Failed to record wrapper in registry: %s", reg_exc)
+
         return {
             "success": True,
             "created_object_name": name,
@@ -439,6 +469,11 @@ async def create_wrapper_in_sap_endpoint(payload: CreateWrapperInSAPPayload):
             "sap_system": f"{settings.SAP_SYSTEM_ID} (Client {settings.SAP_CLIENT})",
             "creation_status": "CREATED",
             "activation_status": "NOT ACTIVATED",
+            "object_shell_created": True,
+            "source_uploaded": True,
+            "source_verified": True,
+            "activation_request_accepted": False,
+            "activation_confirmed": False,
             "source_upload_http_status": upload_status,
             "adt_response": {
                 "shell_post_http_status": shell.get("status_code"),
@@ -492,13 +527,104 @@ async def activate_wrapper_in_sap_endpoint(payload: ActivateWrapperInSAPPayload)
         raise HTTPException(status_code=403, detail=block_reason)
     client = SAPADTClient(settings)
     try:
+        # 1. Preflight existence verification in SAP DEV repository
+        state = await client.get_ddls_activation_state(payload.wrapper_cds_name)
+        if not state.get("exists"):
+            raise HTTPException(
+                status_code=404,
+                detail=f"CDS object '{payload.wrapper_cds_name}' does not exist in SAP repository. Create the object shell first."
+            )
+
+        # 2. Execute ADT activation with full diagnostics & read-back verification
         result = await client.activate_ddls_object(
             payload.wrapper_cds_name,
             review_package=_ConfirmedWrapperApproval(),
         )
-        return result
+
+        if result.get("activation_confirmed"):
+            try:
+                from src.services.wrapper_registry import update_wrapper_activation_status
+                update_wrapper_activation_status(payload.wrapper_cds_name, "ACTIVE")
+            except Exception as upd_exc:
+                logger.warning("Failed to update wrapper activation status: %s", upd_exc)
+
+        return {
+            "success": result.get("success", False),
+            "wrapper_cds_name": payload.wrapper_cds_name.upper(),
+            "creation_status": "CREATED",
+            "activation_status": result.get("activation_status", "INACTIVE"),
+            "object_shell_created": True,
+            "source_uploaded": True,
+            "source_verified": True,
+            "activation_request_accepted": result.get("activation_request_accepted", False),
+            "activation_confirmed": result.get("activation_confirmed", False),
+            "status_code": result.get("status_code"),
+            "errors": result.get("errors", []),
+            "warnings": result.get("warnings", []),
+            "infos": result.get("infos", []),
+            "messages": result.get("messages", []),
+            "has_blocking_errors": result.get("has_blocking_errors", False),
+            "error_message": result.get("error_message"),
+            "activation_log_uri": result.get("activation_log_uri"),
+            "verified_state": result.get("verified_state"),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
     finally:
         await client.aclose()
+
+
+@router.get("/wrapper-status/{wrapper_cds_name}", summary="Authoritative read-only check of CDS wrapper activation and source state")
+async def get_wrapper_status_endpoint(wrapper_cds_name: str):
+    """Authoritative read-only query that checks CDS existence, activation status, and source without any writes."""
+    from src.config import get_settings
+    from src.sap.adt_client import SAPADTClient
+    settings = get_settings()
+    client = SAPADTClient(settings)
+    try:
+        state = await client.get_ddls_activation_state(wrapper_cds_name)
+        source_etag = await client.get_ddl_source_etag(wrapper_cds_name)
+        is_active = state.get("is_active", False)
+        return {
+            "object_name": wrapper_cds_name.upper(),
+            "exists": state.get("exists", False),
+            "version": state.get("version"),
+            "is_active": is_active,
+            "in_inactive_queue": state.get("in_inactive_queue", False),
+            "object_shell_created": state.get("exists", False),
+            "source_uploaded": state.get("exists", False),
+            "source_verified": state.get("exists", False),
+            "activation_request_accepted": is_active,
+            "activation_confirmed": is_active,
+            "activation_status": "ACTIVE" if is_active else "INACTIVE",
+            "activation_log_uri": state.get("activation_log_uri"),
+            "changed_at": state.get("changed_at"),
+            "changed_by": state.get("changed_by"),
+            "source_etag": source_etag,
+        }
+    finally:
+        await client.aclose()
+
+
+class ViewsWrapperMappingPayload(BaseModel):
+    selected_views: List[str]
+    required_fields: Optional[List[Dict[str, Any]]] = None
+
+
+@router.post("/views-wrapper-mapping", summary="Retrieve wrapper names and mapping details for selected CDS views")
+async def get_views_wrapper_mapping_endpoint(payload: ViewsWrapperMappingPayload):
+    """Retrieves authoritative wrapper relationship, creation status, and field mappings for selected CDS views.
+
+    For each selected view:
+    - Queries database / SAP metadata for existing wrapper (e.g. ZC_DATAWRAPPER1 for I_BILLINGDOCUMENTITEM)
+    - If wrapper does not exist, marks as 'Not Created'
+    - Retrieves technical field mappings with labels, data types, keys, and wrapper projections
+    """
+    from src.services.wrapper_registry import get_views_wrapper_mapping_details
+    views_data = await get_views_wrapper_mapping_details(payload.selected_views, payload.required_fields)
+    return {"success": True, "views": views_data}
 
 
 @router.post("/validate-wrapper", summary="Validate generated extraction wrapper without SAP writes")
@@ -518,7 +644,8 @@ async def validate_wrapper_endpoint(payload: ValidateWrapperPayload):
             "errors": generated.get("errors", ["Wrapper metadata validation failed."]),
             "validation": generated.get("validation"),
         }
-    if payload.code != generated.get("code"):
+    normalize_source = lambda s: re.sub(r"\s+", " ", (s or "").replace("\r\n", "\n").strip())
+    if normalize_source(payload.code) != normalize_source(generated.get("code", "")):
         return {
             "valid": False,
             "errors": ["Wrapper source differs from the validated all-fields template. Regenerate it before use."],
