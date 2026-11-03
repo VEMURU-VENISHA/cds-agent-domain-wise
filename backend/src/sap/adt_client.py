@@ -82,24 +82,35 @@ class SAPADTClient:
 
         Enforces that before any TCP/TLS handshake is initiated:
         1. If running against a real SAP host (not using custom mock client), SAP_LIVE_READ_ONLY must be True.
-        2. The request MUST match the exact verified read-only allowlist:
+        2. The request MUST match the exact read-only allowlist:
            - GET /sap/bc/adt/repository/informationsystem/search
            - GET /sap/bc/adt/ddic/ddl/sources/{name}
+           - GET /sap/bc/adt/packages/{package}
+           - GET /sap/bc/adt/cts/transportrequests?user=*
            - POST /sap/bc/adt/checkruns?reporters=abapCheckRun
         3. All other methods and paths (PUT, DELETE, PATCH, or other POSTs) are unconditionally rejected.
         """
         clean_method = method.strip().upper()
         clean_path = path.strip()
+        path_only, separator, query = clean_path.partition("?")
 
         # Check 1: Exact Zero-Write Allowlist (Methods & Paths)
         if clean_method == "GET":
-            is_search = clean_path == "/sap/bc/adt/repository/informationsystem/search"
-            is_ddl_source = bool(re.match(r"^/sap/bc/adt/ddic/ddl/sources/[a-zA-Z0-9_\/]+$", clean_path))
-            is_inactive_objects = clean_path == "/sap/bc/adt/activation/inactiveobjects"
-            if not (is_search or is_ddl_source or is_inactive_objects):
+            is_search = path_only == "/sap/bc/adt/repository/informationsystem/search"
+            is_ddl_source = bool(re.match(r"^/sap/bc/adt/ddic/ddl/sources/[a-zA-Z0-9_\/]+$", path_only))
+            is_inactive_objects = path_only == "/sap/bc/adt/activation/inactiveobjects"
+            is_package_lookup = bool(re.fullmatch(r"/sap/bc/adt/packages/[A-Za-z0-9_/$-]+", path_only)) and not separator
+            is_transport_list = (
+                path_only == "/sap/bc/adt/cts/transportrequests"
+                and bool(re.fullmatch(r"user=(?:\*|[A-Za-z0-9_%.-]+)", query))
+            )
+            # This resource URI is returned by ADT as the transport request's
+            # relation link; allow its read-only detail GET for exact validation.
+            is_transport_detail = bool(re.fullmatch(r"/sap/bc/adt/cts/transportrequests/[A-Z0-9]{10}", path_only)) and not separator
+            if not (is_search or is_ddl_source or is_inactive_objects or is_package_lookup or is_transport_list or is_transport_detail):
                 raise SAPSecurityError(
                     f"Pre-socket security guard blocked non-allowlisted GET endpoint: '{clean_path}'. "
-                    "Only verified read-only search, DDL source, and inactive objects endpoints are permitted."
+                    "Only allowlisted read-only repository, package, transport, and inactive-object endpoints are permitted."
                 )
 
         elif clean_method == "POST":
@@ -161,8 +172,7 @@ class SAPADTClient:
     def validate_transport_request(cls, request_id: Optional[str]) -> bool:
         """Validates that a CTS Workbench Transport Request conforms to SAP rules.
 
-        Format: ^[A-Z0-9]{3}K[0-9]{6}$
-        (e.g., S4HK900123, YAWK900001, DEVK900123)
+        Format: three-character SAP system ID, literal 'K', then six digits.
 
         Rules:
         - Exactly 3 alphanumeric characters (SAP System ID)
@@ -879,6 +889,33 @@ class SAPADTClient:
         self._package_cache[clean_pkg] = fallback
         return fallback
 
+    async def verify_package_exists(self, package_name: str) -> Dict[str, Any]:
+        """Verify a target package using SAP's ADT package resource; never use cached fallbacks."""
+        clean_pkg = (package_name or "").strip().upper()
+        if not clean_pkg or clean_pkg == "$TMP" or not re.fullmatch(r"[A-Z0-9_/]+", clean_pkg):
+            raise SAPConnectorError("A valid, non-local SAP package name is required.")
+        path = f"/sap/bc/adt/packages/{clean_pkg.lower()}"
+        self._assert_zero_write_policy("GET", path, {})
+        headers = self._get_auth_headers()
+        headers["Accept"] = "application/xml, text/xml, */*"
+        params: Dict[str, Any] = {}
+        if self.settings.SAP_SEND_CLIENT_PARAM and self.settings.SAP_CLIENT:
+            params["sap-client"] = self.settings.SAP_CLIENT
+        resp = await self._send_request("GET", path, params=params, headers=headers)
+        self._log_request("GET", path, resp.status_code)
+        if resp.status_code == 200:
+            return {"exists": True, "package": clean_pkg, "description": resp.text[:500]}
+        if resp.status_code == 404:
+            return {"exists": False, "package": clean_pkg}
+        if resp.status_code == 401:
+            raise SAPAuthenticationError("SAP authentication expired while verifying the package.")
+        if resp.status_code == 403:
+            raise SAPPermissionError(resource=path)
+        raise SAPConnectorError(
+            message=f"SAP package verification returned HTTP {resp.status_code}: {resp.text[:500]}",
+            status_code=resp.status_code,
+        )
+
     @staticmethod
     def _build_checkrun_xml(repository_uri: str, version: str = "active") -> str:
         """Constructs the verified XML checkObjectList payload for SAP ADT checkruns.
@@ -1208,8 +1245,10 @@ class SAPADTClient:
         # Pre-socket security check for DEV write
         self.assert_dev_write_policy("POST", path, review_package=review_package)
 
-        desc = (description or clean_name)[:60]
+        from xml.sax.saxutils import escape
+        desc = escape((description or clean_name)[:60])
         pkg_clean = package.strip().upper()
+        pkg_xml = escape(pkg_clean, {'"': "&quot;", "'": "&apos;"})
 
         body = f"""<?xml version="1.0" encoding="utf-8"?>
 <ddl:ddlSource xmlns:ddl="http://www.sap.com/adt/ddic/ddlsources"
@@ -1218,15 +1257,18 @@ class SAPADTClient:
                adtcore:type="DDLS/DF"
                adtcore:description="{desc}"
                adtcore:version="active">
-  <adtcore:packageRef adtcore:name="{pkg_clean}"/>
+   <adtcore:packageRef adtcore:name="{pkg_xml}"/>
 </ddl:ddlSource>"""
 
         # Acquire CSRF token
         csrf_token = await self.fetch_csrf_token(force_refresh=False)
+        if not csrf_token:
+            raise SAPSecurityError("SAP ADT did not provide a CSRF token; CDS repository creation was not sent.")
 
         headers = self._get_auth_headers()
         headers["Content-Type"] = "application/vnd.sap.adt.ddlSource+xml"
         headers["Accept"] = "application/vnd.sap.adt.ddlSource+xml, application/xml, text/xml, */*"
+        headers["X-sap-adt-sessiontype"] = "stateful"
         if csrf_token:
             headers["X-CSRF-Token"] = csrf_token
 
@@ -1235,6 +1277,14 @@ class SAPADTClient:
         try:
             client = await self._get_client()
             resp = await client.post(path, params=params, headers=headers, content=body)
+            if resp.status_code == 403 and (
+                resp.headers.get("x-csrf-token", "").lower() == "required" or "csrf" in resp.text.lower()
+            ):
+                csrf_token = await self.fetch_csrf_token(force_refresh=True)
+                if not csrf_token:
+                    raise SAPSecurityError("SAP ADT rejected the CSRF token and did not issue a replacement; no retry was sent.")
+                headers["X-CSRF-Token"] = csrf_token
+                resp = await client.post(path, params=params, headers=headers, content=body)
             self._log_request("POST", path, resp.status_code)
             logger.info("[ADT CREATE] shell status=%d", resp.status_code)
 
@@ -1333,7 +1383,8 @@ class SAPADTClient:
         corr_nr: Optional[str] = None,
         etag: Optional[str] = None,
         review_package: Optional[Any] = None,
-    ) -> int:
+        include_response: bool = False,
+    ) -> Union[int, Dict[str, Any]]:
         """Step B: Uploads CDS DDL source code into created DDLS object.
 
         Endpoint: PUT /sap/bc/adt/ddic/ddl/sources/{name_lower}/source/main?lockHandle=...&corrNr=...
@@ -1367,6 +1418,8 @@ class SAPADTClient:
         self.assert_dev_write_policy("PUT", path, review_package=review_package)
 
         csrf_token = await self.fetch_csrf_token(force_refresh=False)
+        if not csrf_token:
+            raise SAPSecurityError("SAP ADT did not provide a CSRF token; CDS source upload was not sent.")
 
         headers = self._get_auth_headers()
         headers["Content-Type"] = "text/plain; charset=utf-8"
@@ -1394,10 +1447,20 @@ class SAPADTClient:
         try:
             client = await self._get_client()
             resp = await client.put(path, params=params, headers=headers, content=ddl_source.strip())
+            if resp.status_code == 403 and (
+                resp.headers.get("x-csrf-token", "").lower() == "required" or "csrf" in resp.text.lower()
+            ):
+                csrf_token = await self.fetch_csrf_token(force_refresh=True)
+                if not csrf_token:
+                    raise SAPSecurityError("SAP ADT rejected the CSRF token and did not issue a replacement; no retry was sent.")
+                headers["X-CSRF-Token"] = csrf_token
+                resp = await client.put(path, params=params, headers=headers, content=ddl_source.strip())
             self._log_request("PUT", path, resp.status_code)
             logger.info("[ADT SOURCE UPLOAD] status=%d", resp.status_code)
 
             if resp.status_code in (200, 204):
+                if include_response:
+                    return {"status_code": resp.status_code, "body": resp.text}
                 return resp.status_code
 
             etag_val = resp.headers.get("ETag") or resp.headers.get("etag") or "none"
@@ -1961,23 +2024,21 @@ class SAPADTClient:
 
         Endpoint: GET /sap/bc/adt/cts/transportrequests?user=*
         """
-        configured_tr = getattr(self.settings, "SAP_TRANSPORT_REQUEST", "S3XK911848")
         results = []
-
-        if configured_tr:
-            results.append({
-                "number": configured_tr,
-                "owner": self.settings.SAP_USERNAME or "SYSTEM",
-                "description": f"Configured Workbench Transport ({configured_tr})",
-                "status": "Modifiable",
-                "type": "Workbench Request",
-                "is_default": True,
-            })
 
         if self._custom_client is not None:
             return results
 
-        path = "/sap/bc/adt/cts/transportrequests?user=*"
+        from urllib.parse import quote
+
+        # ADT's user filter only reliably matches request owners. Request tasks can
+        # belong to the authenticated user even when their parent request has a
+        # different owner, so retrieve SAP's returned list and inspect both levels.
+        requested_user = "*"
+        if not requested_user or len(requested_user) > 120:
+            raise SAPSecurityError("Invalid SAP user filter for CTS transport lookup.")
+        path = f"/sap/bc/adt/cts/transportrequests?user={quote(requested_user, safe='*')}"
+        self._assert_zero_write_policy("GET", path, {})
         headers = self._get_auth_headers()
         headers["Accept"] = "application/xml, text/xml, */*"
 
@@ -1986,32 +2047,113 @@ class SAPADTClient:
             if resp.status_code == 200:
                 import xml.etree.ElementTree as ET
                 root = ET.fromstring(resp.text)
-                for req in root.iter("{http://www.sap.com/cts/adt/tm}request"):
-                    num = req.attrib.get("{http://www.sap.com/cts/adt/tm}number") or req.attrib.get("number", "")
-                    if not num or num == configured_tr:
+                namespace = "{http://www.sap.com/cts/adt/tm}"
+                def attr(element, name):
+                    return element.attrib.get(namespace + name) or element.attrib.get(name, "")
+
+                def status_label(value):
+                    return {"R": "Released", "D": "Modifiable"}.get(value, "Unknown")
+
+                for req in root.iter(namespace + "request"):
+                    num = attr(req, "number")
+                    if not num:
                         continue
-                    owner = req.attrib.get("{http://www.sap.com/cts/adt/tm}owner") or req.attrib.get("owner", "")
-                    desc = req.attrib.get("{http://www.sap.com/cts/adt/tm}desc") or req.attrib.get("desc", "")
-                    status = req.attrib.get("{http://www.sap.com/cts/adt/tm}status") or req.attrib.get("status", "")
-                    req_type = req.attrib.get("{http://www.sap.com/cts/adt/tm}type") or req.attrib.get("type", "")
-                    results.append({
+                    owner = attr(req, "owner")
+                    desc = attr(req, "desc")
+                    status = attr(req, "status")
+                    req_type = attr(req, "type")
+                    task_rows = []
+                    for task in req.iter(namespace + "task"):
+                        task_rows.append({
+                            "number": attr(task, "number"),
+                            "owner": attr(task, "owner"),
+                            "status_code": attr(task, "status"),
+                            "status": status_label(attr(task, "status")),
+                        })
+                    request_modifiable = status == "D"
+                    request_is_workbench = req_type == "K"
+                    request_owned_by_user = bool(user) and owner.casefold() == user.strip().casefold()
+                    user_has_modifiable_task = any(
+                        bool(user)
+                        and task["owner"].casefold() == user.strip().casefold()
+                        and task["status_code"] == "D"
+                        for task in task_rows
+                    )
+                    actual_request = {
                         "number": num,
                         "owner": owner,
                         "description": desc,
-                        "status": "Released" if status == "R" else "Modifiable",
+                        "status_code": status,
+                        "status": status_label(status),
                         "type": "Workbench" if req_type == "K" else ("Customizing" if req_type == "W" else req_type),
+                        "tasks": task_rows,
+                        "is_modifiable": request_modifiable,
+                        "is_workbench": request_is_workbench,
+                        "is_eligible_for_user": request_modifiable and request_is_workbench and (request_owned_by_user or user_has_modifiable_task),
                         "is_default": False,
-                    })
+                        "is_sap_verified": True,
+                    }
+                    results.append(actual_request)
             else:
-                logger.warning(
-                    "CTS transport request query returned HTTP %d: %s",
-                    resp.status_code,
-                    resp.text[:200] if resp.text else "(empty body)",
-                )
-        except Exception as e:
-            logger.warning("Failed to fetch CTS transport requests: %s", e)
+                raise SAPConnectorError(f"SAP ADT transport lookup returned HTTP {resp.status_code}: {(resp.text or '')[:300]}", status_code=resp.status_code)
+        except Exception:
+            logger.exception("Failed to fetch CTS transport requests")
+            raise
 
         return results
+
+    async def get_transport_request(self, request_id: str, user: Optional[str] = None) -> Dict[str, Any]:
+        """Read one CTS request through the detail resource linked by ADT list results."""
+        clean_id = (request_id or "").strip().upper()
+        if not self.validate_transport_request(clean_id):
+            raise SAPTransportRequestError("Invalid SAP CTS Workbench request identifier.")
+        path = f"/sap/bc/adt/cts/transportrequests/{clean_id}"
+        self._assert_zero_write_policy("GET", path, {})
+        headers = self._get_auth_headers()
+        headers["Accept"] = "application/xml, text/xml, */*"
+        resp = await self._send_request("GET", path, headers=headers)
+        if resp.status_code == 404:
+            raise SAPNotFoundError(f"SAP ADT confirmed that transport request '{clean_id}' does not exist or is not accessible.")
+        if resp.status_code != 200:
+            raise SAPConnectorError(
+                f"SAP ADT transport detail lookup returned HTTP {resp.status_code}: {(resp.text or '')[:500]}",
+                status_code=resp.status_code,
+            )
+
+        root = ET.fromstring(resp.text)
+        namespace = "{http://www.sap.com/cts/adt/tm}"
+        def attr(element, name):
+            return element.attrib.get(namespace + name) or element.attrib.get(name, "")
+
+        request = next((node for node in root.iter(namespace + "request") if attr(node, "number").upper() == clean_id), None)
+        if request is None:
+            raise SAPConnectorError(f"SAP ADT returned HTTP 200 but no matching request object for '{clean_id}'.")
+        status = attr(request, "status")
+        owner = attr(request, "owner")
+        req_type = attr(request, "type")
+        tasks = [
+            {"number": attr(task, "number"), "owner": attr(task, "owner"), "status_code": attr(task, "status")}
+            for task in request.iter(namespace + "task")
+        ]
+        user_matches = bool(user) and owner.casefold() == user.strip().casefold()
+        user_matches = user_matches or any(
+            bool(user) and task["owner"].casefold() == user.strip().casefold() and task["status_code"] == "D"
+            for task in tasks
+        )
+        return {
+            "number": clean_id,
+            "owner": owner,
+            "description": attr(request, "desc"),
+            "status_code": status,
+            "status": {"R": "Released", "D": "Modifiable"}.get(status, "Unknown"),
+            "type": "Workbench" if req_type == "K" else ("Customizing" if req_type == "W" else req_type),
+            "tasks": tasks,
+            "is_modifiable": status == "D",
+            "is_workbench": req_type == "K",
+            "is_eligible_for_user": status == "D" and req_type == "K" and user_matches,
+            "is_sap_verified": True,
+            "http_status": resp.status_code,
+        }
 
 
 

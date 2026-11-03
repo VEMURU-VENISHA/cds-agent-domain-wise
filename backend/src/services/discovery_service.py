@@ -23,6 +23,7 @@ from src.sap.adt_client import SAPADTClient
 from src.sap.adt_connector import SAPADTConnector
 from src.sap.connector import get_sap_connector
 from src.services.cds_classifier import cds_classifier, CDSClassificationType
+from src.services.extraction_wrapper_policy import can_create_extraction_wrapper
 from src.services.normalizer import (
     canonicalize,
     get_synonym_cluster,
@@ -405,6 +406,8 @@ class CDSDiscoveryService:
             self._search_cache.clear()
             self._relationship_graph = None
             self._graph_metadata.clear()
+            self._extraction_metadata_cache = None
+            self._extraction_cache_timestamp = 0.0
         except Exception as e:
             logger.error(f"Failed to refresh metadata: {e}")
         finally:
@@ -1941,6 +1944,112 @@ class CDSDiscoveryService:
             ),
         }
 
+    @staticmethod
+    def _component_extraction_status(
+        cds_name: str,
+        source_code: str,
+        extraction_records: Dict[str, Any],
+        metadata_success: bool,
+        metadata_complete: bool,
+    ) -> Dict[str, Any]:
+        """Cross-check one CDS source annotation against SAP's extraction catalog."""
+        annotation_match = re.search(
+            r"@Analytics\.dataExtraction\.enabled\s*:\s*(true|false)\b",
+            source_code or "",
+            re.IGNORECASE,
+        )
+        if not annotation_match:
+            analytics_block = re.search(
+                r"@Analytics\s*:\s*\{([\s\S]*?)\n\s*\}",
+                source_code or "",
+                re.IGNORECASE,
+            )
+            if analytics_block:
+                extraction_block = re.search(
+                    r"dataExtraction\s*:\s*\{([\s\S]*?)\}",
+                    analytics_block.group(1),
+                    re.IGNORECASE,
+                )
+                if extraction_block:
+                    annotation_match = re.search(
+                        r"\benabled\s*:\s*(true|false)\b",
+                        extraction_block.group(1),
+                        re.IGNORECASE,
+                    )
+        annotation = annotation_match.group(1).upper() if annotation_match else None
+        annotation_evidence = (
+            f"Source DDL contains @Analytics.dataExtraction.enabled: {annotation.lower()}"
+            if annotation
+            else "Source DDL is unavailable or does not expose @Analytics.dataExtraction.enabled."
+        )
+
+        record = extraction_records.get(cds_name.strip().upper())
+        if record is not None:
+            sap_enabled = True
+            sap_evidence = "Listed in SAP I_DataExtractionEnabledView."
+        elif metadata_success and metadata_complete:
+            sap_enabled = False
+            sap_evidence = "Not listed in the complete SAP I_DataExtractionEnabledView result."
+        else:
+            sap_enabled = None
+            sap_evidence = "SAP I_DataExtractionEnabledView could not be verified completely."
+
+        if annotation == "TRUE" and sap_enabled is True:
+            status = "TRUE"
+        elif annotation == "FALSE" and sap_enabled is False:
+            status = "FALSE"
+        else:
+            status = "UNKNOWN"
+
+        component = {
+            "cds_name": cds_name,
+            "status": status,
+            "annotation_status": annotation or "UNKNOWN",
+            "sap_metadata_status": "TRUE" if sap_enabled is True else "FALSE" if sap_enabled is False else "UNKNOWN",
+            "evidence": [annotation_evidence, sap_evidence],
+            "sap_description": (record or {}).get("description"),
+        }
+        component["can_create_extraction_wrapper"] = can_create_extraction_wrapper(component)
+        return component
+
+    async def get_verified_component_extraction_status(
+        self,
+        cds_name: str,
+        allow_live_source_retrieval: bool = True,
+    ) -> Dict[str, Any]:
+        """Resolve one CDS view's source and SAP catalog evidence using the shared policy."""
+        clean_name = (cds_name or "").strip()
+        if not clean_name:
+            return self._component_extraction_status("", "", {}, False, False)
+        metadata = await self.get_authoritative_extraction_metadata()
+        code = ""
+        try:
+            with self._get_db() as conn:
+                row = conn.execute(
+                    "SELECT source_code FROM cds_views WHERE UPPER(cds_name) = ?",
+                    (clean_name.upper(),),
+                ).fetchone()
+            if row and row[0] and "SOURCE_UNAVAILABLE" not in str(row[0]).upper():
+                code = str(row[0])
+        except Exception as exc:
+            logger.warning("Could not read indexed DDL for %s: %s", clean_name, exc)
+
+        if not code and allow_live_source_retrieval:
+            client = SAPADTClient(self.settings)
+            try:
+                code = await client.get_ddl_source(clean_name)
+            except Exception as exc:
+                logger.info("Live DDL unavailable for %s; extraction status remains evidence-limited: %s", clean_name, exc)
+            finally:
+                await client.aclose()
+        return self._component_extraction_status(
+            cds_name=clean_name,
+            source_code=code,
+            extraction_records=metadata.get("records", {}) if metadata.get("success") else {},
+            metadata_success=bool(metadata.get("success")),
+            metadata_complete=bool(metadata.get("is_complete")),
+        )
+
     async def run_discovery(
         self,
         requirement_text: str,
@@ -2505,6 +2614,25 @@ class CDSDiscoveryService:
                             # Allow 1 intermediate structural hop if depth == 1
                             if new_depth == 1:
                                 queue.append((nbr_up, new_path_views, new_path_edges, curr_matched))
+
+        # Attach independently verified extraction evidence to every CDS in each candidate.
+        source_by_view = {
+            str(view.get("cds_name", "")).strip().upper(): view.get("source_code") or ""
+            for view in views
+        }
+        for candidate in all_candidates:
+            component_names = candidate.get("views") or [candidate.get("cds_name", "")]
+            candidate["component_extraction_statuses"] = [
+                self._component_extraction_status(
+                    cds_name=name,
+                    source_code=source_by_view.get(name.strip().upper(), ""),
+                    extraction_records=ext_records,
+                    metadata_success=ext_success,
+                    metadata_complete=ext_complete,
+                )
+                for name in component_names
+                if name and name.strip()
+            ]
 
         # Apply Authoritative Data Extraction Filtering from I_DataExtractionEnabledView
         extraction_stats = {

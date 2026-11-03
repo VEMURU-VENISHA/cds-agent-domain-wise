@@ -10,10 +10,68 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from src.config import get_settings
+from src.core.exceptions import SAPNotFoundError
 from src.logging_config import logger
+from src.sap.adt_client import SAPADTClient
 from src.services.cds_generation_validator import CDSGenerationValidator
 from src.services.discovery_service import CDSDiscoveryService
 import re as _re
+import hashlib as _hashlib
+
+
+def _indexed_sql_view_names() -> set[str]:
+    """Read SQL view names from the existing SAP ADT source index without writing to it."""
+    discovery = CDSDiscoveryService()
+    try:
+        with discovery._get_db() as conn:
+            rows = conn.execute(
+                "SELECT source_code FROM cds_views WHERE source_code IS NOT NULL AND source_code != ''"
+            ).fetchall()
+    except Exception as exc:
+        raise ValueError(f"Unable to verify SQL view name uniqueness from the SAP metadata index: {exc}") from exc
+
+    if not rows:
+        raise ValueError("Unable to verify SQL view name uniqueness: the SAP metadata index has no CDS source DDL.")
+    names = set()
+    for row in rows:
+        match = _re.search(
+            r"@AbapCatalog\.sqlViewName\s*:\s*['\"]?([A-Za-z0-9_]+)",
+            row[0] or "",
+            _re.IGNORECASE,
+        )
+        if match:
+            names.add(match.group(1).upper())
+    return names
+
+
+def generate_sql_view_name(
+    wrapper_cds_name: str,
+    existing_sql_view_names: Optional[set[str]] = None,
+) -> str:
+    """Generate a valid, collision-checked classic ABAP SQL view name (maximum 16 chars)."""
+    wrapper = (wrapper_cds_name or "").strip().upper()
+    if not _re.fullmatch(r"[ZY][A-Z0-9_]{0,29}", wrapper):
+        raise ValueError("Wrapper CDS name must be a valid Z* or Y* name of at most 30 characters.")
+
+    occupied = {name.strip().upper() for name in (existing_sql_view_names if existing_sql_view_names is not None else _indexed_sql_view_names())}
+    prefix = wrapper[0]
+    stem = _re.sub(r"[^A-Z0-9_]", "", wrapper[1:]).strip("_") or "WRAPPER"
+
+    # Preserve a short name when available, then use deterministic hash suffixes for alternatives.
+    candidates = [wrapper] if len(wrapper) <= 16 else []
+    for salt in range(256):
+        digest_input = wrapper if salt == 0 else f"{wrapper}:{salt}"
+        suffix = _hashlib.sha1(digest_input.encode("ascii")).hexdigest()[:4].upper()
+        candidates.append(f"{prefix}{stem[:10]}_{suffix}")
+
+    for candidate in candidates:
+        if len(candidate) <= 16 and _re.fullmatch(r"[ZY][A-Z0-9_]{0,15}", candidate) and candidate not in occupied:
+            return candidate
+
+    raise ValueError(
+        f"Could not generate a unique SQL view name for '{wrapper_cds_name}'. "
+        "All valid candidates conflict with existing SAP SQL view metadata."
+    )
 
 
 CDS_GENERATION_SYSTEM_PROMPT = """You are an expert SAP ABAP CDS View Entity code generator adhering strictly to SAP S/4HANA Clean Core standards. You MUST follow these rules EXACTLY. Violation of ANY rule is a CRITICAL BUG.
@@ -1405,128 +1463,205 @@ Return JSON strictly:
         mappings: List[Dict[str, Any]],
         join_paths: Optional[List[Dict[str, Any]]] = None,
         output_fields: Optional[List[Dict[str, Any]]] = None,
-        artifact_name: str = "ZC_CustomExtractionWrapper",
+        artifact_name: str = "",
+        wrapper_label: str = "",
+        sql_view_name: str = "",
+        kpi: Optional[Dict[str, Any]] = None,
+        selected_views_original_ddl: Optional[Dict[str, str]] = None,
         max_attempts: int = 3,
     ) -> Dict[str, Any]:
-        """Generates extraction wrapper with automated validation correction loop (max 3 attempts).
+        """Build and validate the fixed all-fields extraction wrapper template in memory."""
+        wrapper_name = (artifact_name or "").strip()
+        label = (wrapper_label or "").strip()
+        sql_name = (sql_view_name or "").strip().upper()
+        sources = [name.strip() for name in (selected_views or []) if name and name.strip()]
+        errors: List[str] = []
 
-        Rules (Part 7, Part 8, Part 9):
-        1. Enforces complete original source DDL for every selected view.
-        2. Includes @Analytics.dataExtraction.enabled: true.
-        3. Runs in-memory validation (Stage A static + Stage B SAP source-only investigation).
-        4. When errors occur, passes exact line-numbered errors back to LLM to correct only reported issues.
-        5. Strictly stops after a maximum of THREE attempts if errors persist.
-        """
-        max_attempts = min(max(1, max_attempts), 3)  # Strictly enforce max 3
-        correction_history: List[Dict[str, Any]] = []
+        if not sources:
+            errors.append("A source CDS view from the discovery workflow is required.")
+        elif len(sources) != 1:
+            errors.append("This wrapper template accepts exactly one verified source CDS view.")
+        if not wrapper_name:
+            errors.append("Wrapper CDS name is required.")
+        elif len(wrapper_name) > 30 or not _re.fullmatch(r"[ZY][A-Za-z0-9_]*", wrapper_name, _re.IGNORECASE):
+            errors.append("Wrapper CDS name must begin with Z or Y, contain only letters, numbers, and underscores, and be at most 30 characters.")
+        if not sql_name:
+            errors.append("SQL view name is required.")
+        elif not _re.fullmatch(r"[ZY][A-Z0-9_]{0,15}", sql_name):
+            errors.append("SQL view name must begin with Z or Y, contain only letters, numbers, and underscores, and be at most 16 characters for this ABAP CDS view type.")
+        if not label:
+            errors.append("Wrapper label is required.")
+        elif len(label) > 60:
+            errors.append("Wrapper label cannot exceed 60 characters for the target ABAP release.")
+        if errors:
+            return {"success": False, "valid": False, "status": "INPUT_VALIDATION_FAILED", "errors": errors}
 
-        # Attempt 1: Initial Generation
-        gen_response = await self.generate_cds_code(
-            requirement=requirement,
-            selected_views=selected_views,
-            mappings=mappings,
-            join_paths=join_paths,
-            artifact_name=artifact_name,
-        )
+        source_name = sources[0]
+        if not _re.fullmatch(r"[A-Za-z_][A-Za-z0-9_/]*", source_name):
+            return {
+                "success": False,
+                "valid": False,
+                "status": "INPUT_VALIDATION_FAILED",
+                "errors": ["The discovery workflow supplied an invalid source CDS name."],
+            }
 
-        current_code = gen_response.get("result", {}).get("code", "")
-        verified_context = {
-            "artifact_name": artifact_name,
-            "selected_views": selected_views,
-            "mappings": mappings,
-            "join_paths": join_paths,
-        }
+        client = SAPADTClient(get_settings())
+        metadata_source = "LIVE_SAP_ADT"
+        try:
+            try:
+                source_ddl = await client.get_ddl_source(source_name)
+            except SAPNotFoundError:
+                return {
+                    "success": False,
+                    "valid": False,
+                    "status": "SOURCE_METADATA_VALIDATION_FAILED",
+                    "errors": [f"Source CDS '{source_name}' does not exist in SAP ADT metadata."],
+                }
+            except Exception as exc:
+                discovery = CDSDiscoveryService()
+                with discovery._get_db() as conn:
+                    indexed = conn.execute(
+                        "SELECT cds_name, source_code FROM cds_views WHERE UPPER(cds_name) = ?",
+                        (source_name.upper(),),
+                    ).fetchone()
+                if not indexed or not indexed[1]:
+                    return {
+                        "success": False,
+                        "valid": False,
+                        "status": "SOURCE_METADATA_VALIDATION_FAILED",
+                        "errors": [f"Could not verify source CDS '{source_name}' in live or indexed SAP ADT metadata: {exc}"],
+                    }
+                source_ddl = indexed[1]
+                metadata_source = "INDEXED_SAP_ADT_SOURCE"
+            if not source_ddl or not source_ddl.strip():
+                return {
+                    "success": False,
+                    "valid": False,
+                    "status": "SOURCE_METADATA_VALIDATION_FAILED",
+                    "errors": [f"SAP ADT returned no source DDL for '{source_name}'."],
+                }
+            definition = _re.search(
+                r"\bdefine\s+(?:(?:root|projection)\s+)?view(?:\s+entity)?\s+([A-Za-z0-9_/]+)",
+                source_ddl,
+                _re.IGNORECASE,
+            )
+            if not definition or definition.group(1).upper() != source_name.upper():
+                return {
+                    "success": False,
+                    "valid": False,
+                    "status": "SOURCE_METADATA_VALIDATION_FAILED",
+                    "errors": [f"Retrieved source DDL does not confirm the exact CDS definition name '{source_name}'."],
+                }
 
-        val_res = CDSGenerationValidator.investigate_and_validate_in_memory(current_code, verified_context)
-        correction_history.append({
-            "attempt": 1,
-            "action": "INITIAL_GENERATION",
-            "valid": val_res["valid"],
-            "errors": val_res["errors"],
-            "warnings": val_res["warnings"],
-            "code_hash": val_res.get("ddl_in_memory_hash"),
-        })
+            try:
+                await client.get_ddl_source(wrapper_name)
+                return {
+                    "success": False,
+                    "valid": False,
+                    "status": "WRAPPER_NAME_CONFLICT",
+                    "errors": [f"Wrapper CDS name '{wrapper_name}' already exists in SAP. Choose a unique name."],
+                }
+            except SAPNotFoundError:
+                pass
+            except Exception as exc:
+                discovery = CDSDiscoveryService()
+                with discovery._get_db() as conn:
+                    indexed_wrapper = conn.execute(
+                        "SELECT 1 FROM cds_views WHERE UPPER(cds_name) = ?",
+                        (wrapper_name,),
+                    ).fetchone()
+                if indexed_wrapper:
+                    return {
+                        "success": False,
+                        "valid": False,
+                        "status": "WRAPPER_NAME_CONFLICT",
+                        "errors": [f"Wrapper CDS name '{wrapper_name}' already exists in indexed SAP metadata."],
+                    }
+                metadata_source = f"{metadata_source}+INDEXED_SAP_ADT_NAME_CHECK"
 
-        if val_res["valid"]:
+            try:
+                sql_view_name = sql_name
+                if sql_view_name in _indexed_sql_view_names():
+                    raise ValueError(f"SQL view name '{sql_view_name}' already exists in indexed SAP CDS metadata.")
+            except ValueError as exc:
+                return {
+                    "success": False,
+                    "valid": False,
+                    "status": "SQL_VIEW_NAME_VALIDATION_FAILED",
+                    "errors": [str(exc)],
+                }
+
+            safe_label = label.replace("'", "''")
+            code = f"""@AbapCatalog.sqlViewName: '{sql_view_name}'
+@AbapCatalog.compiler.compareFilter: true
+@AbapCatalog.preserveKey: true
+@AccessControl.authorizationCheck: #NOT_REQUIRED
+@EndUserText.label: '{safe_label}'
+@Metadata.ignorePropagatedAnnotations: true
+
+@Analytics: {{
+    dataExtraction: {{
+        enabled: true,
+        delta.changeDataCapture.automatic: true
+    }}
+}}
+
+define view {wrapper_name}
+    as select from {source_name}
+{{
+    *
+}}"""
+
+            mandatory_annotations = (
+                "@AbapCatalog.sqlViewName:",
+                "@AbapCatalog.compiler.compareFilter: true",
+                "@AbapCatalog.preserveKey: true",
+                "@AccessControl.authorizationCheck: #NOT_REQUIRED",
+                "@EndUserText.label:",
+                "@Metadata.ignorePropagatedAnnotations: true",
+                "dataExtraction: {",
+                "enabled: true",
+                "delta.changeDataCapture.automatic: true",
+            )
+            missing = [annotation for annotation in mandatory_annotations if annotation not in code]
+            source_clause = _re.search(
+                rf"define\s+view\s+{_re.escape(wrapper_name)}\s+as\s+select\s+from\s+{_re.escape(source_name)}\s*\{{\s*\*\s*\}}",
+                code,
+                _re.IGNORECASE | _re.DOTALL,
+            )
+            if missing or not source_clause or "*" not in code:
+                errors = [f"Generated wrapper failed deterministic validation; missing or invalid: {', '.join(missing) or 'exact source projection' }."]
+                return {"success": False, "valid": False, "status": "GENERATION_VALIDATION_FAILED", "errors": errors}
+
             return {
                 "success": True,
                 "valid": True,
                 "status": "STATIC_VALIDATION_PASSED",
                 "code_status": "Validated In-Memory",
-                "code": current_code,
-                "artifact_name": artifact_name,
+                "code": code,
+                "artifact_name": wrapper_name,
+                "wrapper_label": label,
+                "source_cds_name": source_name,
+                "sql_view_name": sql_view_name,
                 "attempts": 1,
-                "max_attempts": max_attempts,
-                "correction_history": correction_history,
-                "validation": val_res,
-                "sap_source_validation_status": val_res["sap_source_validation_status"],
-                "sap_investigation": val_res["sap_investigation"],
-            }
-
-        # Attempts 2..3: Correction Loop
-        current_attempt = 1
-        while current_attempt < max_attempts and not val_res["valid"]:
-            current_attempt += 1
-            feedback = (
-                f"Correction Attempt {current_attempt}/{max_attempts}. "
-                f"Please fix the following exact line-numbered validation errors: {json.dumps(val_res['errors'])}. "
-                f"Strictly preserve all selected source CDS views {selected_views}, approved join paths, "
-                f"and verified technical field names. Do not invent unverified names or relations."
-            )
-
-            regen_res = await self.regenerate_code(
-                current_code=current_code,
-                feedback=feedback,
-                verified_context=verified_context,
-                validation_errors=val_res["errors"],
-            )
-
-            if regen_res.get("result", {}).get("code"):
-                current_code = regen_res["result"]["code"]
-
-            val_res = CDSGenerationValidator.investigate_and_validate_in_memory(current_code, verified_context)
-            correction_history.append({
-                "attempt": current_attempt,
-                "action": f"CORRECTION_ATTEMPT_{current_attempt}",
-                "valid": val_res["valid"],
-                "errors": val_res["errors"],
-                "warnings": val_res["warnings"],
-                "code_hash": val_res.get("ddl_in_memory_hash"),
-            })
-
-            if val_res["valid"]:
-                return {
-                    "success": True,
+                "validation": {
                     "valid": True,
-                    "status": "STATIC_VALIDATION_PASSED",
-                    "code_status": "Validated In-Memory (After Correction)",
-                    "code": current_code,
-                    "artifact_name": artifact_name,
-                    "attempts": current_attempt,
-                    "max_attempts": max_attempts,
-                    "correction_history": correction_history,
-                    "validation": val_res,
-                    "sap_source_validation_status": val_res["sap_source_validation_status"],
-                    "sap_investigation": val_res["sap_investigation"],
-                }
-
-        # If max attempts reached and still invalid: halt and report remaining errors
-        return {
-            "success": False,
-            "valid": False,
-            "status": "FAILED_VALIDATION",
-            "code_status": "Validation Failed After Max Attempts",
-            "code": current_code,
-            "artifact_name": artifact_name,
-            "attempts": current_attempt,
-            "max_attempts": max_attempts,
-            "correction_history": correction_history,
-            "validation": val_res,
-            "errors": val_res["errors"],
-            "sap_source_validation_status": val_res["sap_source_validation_status"],
-            "sap_investigation": val_res["sap_investigation"],
-            "halt_reason": f"Maximum correction attempts ({max_attempts}) reached. Stopping correction loop.",
-        }
+                    "errors": [],
+                    "source_cds_exists_in_sap": True,
+                    "source_metadata_source": metadata_source,
+                    "live_sap_connection_available": metadata_source == "LIVE_SAP_ADT",
+                    "wrapper_name_unique_in_indexed_sap_metadata": True,
+                    "sql_view_name_unique_in_indexed_sap_metadata": True,
+                    "source_clause_exact": True,
+                    "all_fields_projection": True,
+                    "mandatory_annotations_present": True,
+                    "cdc_compatibility": "Requires SAP checkrun/activation validation; annotation alone does not guarantee CDC support.",
+                },
+                "sap_source_validation_status": "NOT_RUN_NO_SAP_WRITES",
+                "message": "Generated in memory only. No SAP object was created, activated, or deployed.",
+            }
+        finally:
+            await client.aclose()
 
 
 

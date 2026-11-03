@@ -1,14 +1,17 @@
 """Application Configuration Module using Pydantic Settings."""
 
 from functools import lru_cache
+from pathlib import Path
 from typing import List, Optional, Union
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+BACKEND_DIR = Path(__file__).resolve().parents[1]
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=(".env", "../.env"),
+        env_file=(BACKEND_DIR / ".env", BACKEND_DIR.parent / ".env"),
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,
@@ -50,6 +53,7 @@ class Settings(BaseSettings):
     SAP_CONNECTOR_ENABLED: bool = False
     SAP_CONNECTOR_TYPE: str = "stub"  # "stub" or "adt"
     SAP_SYSTEM_ID: str = "DEV"
+    SAP_DEV_SYSTEM_ID: str = ""
     SAP_CLIENT: str = "100"
     SAP_S4HANA_RELEASE: str = "2023"
     SAP_S4CORE_RELEASE: str = "108 SP03"
@@ -57,8 +61,8 @@ class Settings(BaseSettings):
 
     # Mandatory Live Read-Only Safety Gates
     SAP_LIVE_READ_ONLY: bool = Field(
-        default=False,
-        description="Mandatory kill switch: must be True for any live SAP request. If False, live requests are rejected.",
+        default=True,
+        description="Read-only live SAP mode. Writes remain blocked unless explicitly disabled together with SAP_DEV_WRITE_ENABLED.",
     )
     SAP_LIVE_TEST_ENABLED: bool = Field(
         default=False,
@@ -66,7 +70,7 @@ class Settings(BaseSettings):
     )
     SAP_DEV_WRITE_ENABLED: bool = Field(
         default=False,
-        description="Explicit opt-in flag required for controlled SAP DEV write operations (Milestone 13).",
+        description="Administrator opt-in required for controlled SAP DEV write operations. Defaults to read-only.",
     )
     SAP_CREATION_TEST_BYPASS_VALIDATION: bool = Field(
         default=False,

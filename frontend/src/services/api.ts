@@ -409,7 +409,9 @@ export async function generateWrapperCode(payload: {
   join_paths?: any[];
   output_fields?: any[];
   kpi?: any;
-  artifact_name?: string;
+  artifact_name: string;
+  wrapper_label: string;
+  sql_view_name: string;
   join_configuration_approved: boolean;
   selected_views_original_ddl?: Record<string, string>;
 }) {
@@ -423,6 +425,77 @@ export async function generateWrapperCode(payload: {
     throw new Error(err?.detail || 'Failed to generate custom extraction wrapper');
   }
   return res.json();
+}
+
+export async function validateWrapperCode(payload: {
+  code: string;
+  source_cds_view_name: string;
+  sql_view_name: string;
+  wrapper_label: string;
+  wrapper_cds_name: string;
+}) {
+  const res = await fetch(`${API_BASE}/requirements/validate-wrapper`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const result = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(result?.detail || 'Failed to validate extraction wrapper');
+  return result;
+}
+
+export async function createWrapperInSap(payload: {
+  code: string;
+  source_cds_view_name: string;
+  sql_view_name: string;
+  wrapper_label: string;
+  wrapper_cds_name: string;
+  package: string;
+  transport_request: string;
+  confirmed: boolean;
+}) {
+  const res = await fetch(`${API_BASE}/requirements/create-wrapper`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const result = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const detail = result?.detail;
+    throw new Error(typeof detail === 'string' ? detail : detail?.message || detail?.errors?.join(' ') || 'SAP CDS creation failed');
+  }
+  return result;
+}
+
+export async function fetchWrapperWriteCapability(transportRequest?: string): Promise<{
+  write_enabled: boolean;
+  reason?: string | null;
+  eligible_transports?: Array<{ number: string; description?: string; owner?: string }>;
+  transport_diagnostic?: string;
+}> {
+  const query = transportRequest ? `?transport_request=${encodeURIComponent(transportRequest)}` : '';
+  const res = await fetch(`${API_BASE}/requirements/wrapper-write-capability${query}`);
+  const result = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(result?.detail || 'Unable to read SAP write mode');
+  return result;
+}
+
+export async function activateWrapperInSap(payload: {
+  wrapper_cds_name: string;
+  transport_request: string;
+  confirmed: boolean;
+}) {
+  const res = await fetch(`${API_BASE}/requirements/activate-wrapper`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const result = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const detail = result?.detail;
+    throw new Error(typeof detail === 'string' ? detail : detail?.message || 'SAP CDS activation failed');
+  }
+  return result;
 }
 
 export async function validateMemoryOnly(code: string, verifiedContext: any) {

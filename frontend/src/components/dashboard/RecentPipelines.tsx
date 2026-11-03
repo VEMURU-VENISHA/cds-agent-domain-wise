@@ -43,6 +43,11 @@ import {
   fetchMetadataStatus,
   refreshMetadata,
   generateCdsCode,
+  generateWrapperCode,
+  validateWrapperCode,
+  createWrapperInSap,
+  fetchWrapperWriteCapability,
+  activateWrapperInSap,
   regenerateCdsCode,
   validateArtifactName,
   directCreateInSap,
@@ -175,6 +180,24 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
   const [metadataStatus, setMetadataStatus] = useState<any>(null);
   const [metadataRefreshing, setMetadataRefreshing] = useState(false);
   const [detailsModalItem, setDetailsModalItem] = useState<any>(null);
+  const [wrapperModalOpen, setWrapperModalOpen] = useState(false);
+  const [wrapperSourceName, setWrapperSourceName] = useState('');
+  const [wrapperSqlViewName, setWrapperSqlViewName] = useState('');
+  const [wrapperLabel, setWrapperLabel] = useState('');
+  const [wrapperCdsName, setWrapperCdsName] = useState('');
+  const [wrapperPackage, setWrapperPackage] = useState('');
+  const [wrapperTransportRequest, setWrapperTransportRequest] = useState('');
+  const [wrapperTransportVerified, setWrapperTransportVerified] = useState(false);
+  const [wrapperGenerationResult, setWrapperGenerationResult] = useState<any>(null);
+  const [wrapperValidationResult, setWrapperValidationResult] = useState<any>(null);
+  const [wrapperCreationResult, setWrapperCreationResult] = useState<any>(null);
+  const [wrapperActivationResult, setWrapperActivationResult] = useState<any>(null);
+  const [isGeneratingWrapper, setIsGeneratingWrapper] = useState(false);
+  const [isValidatingWrapper, setIsValidatingWrapper] = useState(false);
+  const [isCreatingWrapper, setIsCreatingWrapper] = useState(false);
+  const [isActivatingWrapper, setIsActivatingWrapper] = useState(false);
+  const [wrapperActionError, setWrapperActionError] = useState('');
+  const [wrapperWriteCapability, setWrapperWriteCapability] = useState<any>(null);
 
   // Live Source Viewer Modal state (Change 1)
   const [sourceModalData, setSourceModalData] = useState<any | null>(null);
@@ -325,6 +348,25 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
     loadTransports();
   }, []);
 
+  useEffect(() => {
+    if (!wrapperModalOpen) return;
+    let isCurrent = true;
+    const refreshCapability = () => fetchWrapperWriteCapability(wrapperTransportVerified ? wrapperTransportRequest : undefined)
+      .then((capability) => {
+        if (!isCurrent) return;
+        const selectedTransportValid = (capability.eligible_transports || []).some(
+          (transport) => transport.number.toUpperCase() === wrapperTransportRequest.trim().toUpperCase()
+        );
+        setWrapperWriteCapability({ ...capability, selected_transport_valid: selectedTransportValid });
+      })
+      .catch((error: any) => {
+        if (isCurrent) setWrapperWriteCapability({ write_enabled: false, selected_transport_valid: false, reason: error?.message || 'SAP ADT connection or transport authorization could not be verified.' });
+      });
+    void refreshCapability();
+    const capabilityTimer = window.setInterval(refreshCapability, 15000);
+    return () => { isCurrent = false; window.clearInterval(capabilityTimer); };
+  }, [wrapperModalOpen, wrapperTransportRequest, wrapperTransportVerified]);
+
   const loadTransports = async () => {
     setIsLoadingTransports(true);
     try {
@@ -396,6 +438,35 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
       const res = await refreshMetadata();
       if (res) {
         setMetadataStatus(res);
+        const viewNames = Array.from(new Set(
+          allCandidates.flatMap((candidate: any) =>
+            (candidate.component_extraction_statuses || []).map((component: any) => component.cds_name).filter(Boolean)
+          )
+        ));
+        if (viewNames.length) {
+          const statusResults = await Promise.allSettled(viewNames.map((viewName) => fetchExtractionStatus(viewName)));
+          const byView = new Map<string, any>();
+          statusResults.forEach((result, index) => {
+            if (result.status === 'fulfilled') {
+              const status = result.value;
+              byView.set(viewNames[index].toUpperCase(), {
+                cds_name: status.cds_name,
+                status: status.status || 'UNKNOWN',
+                annotation_status: status.annotation_status || 'UNKNOWN',
+                sap_metadata_status: status.sap_metadata_status || 'UNKNOWN',
+                evidence: status.evidence || [],
+                sap_description: status.sap_description,
+                can_create_extraction_wrapper: status.can_create_extraction_wrapper === true,
+              });
+            }
+          });
+          setAllCandidates((previous) => previous.map((candidate: any) => ({
+            ...candidate,
+            component_extraction_statuses: (candidate.component_extraction_statuses || []).map((component: any) =>
+              byView.get(component.cds_name.toUpperCase()) || component
+            ),
+          })));
+        }
       }
     } catch (err: any) {
       setGeneralError(err?.message || 'Failed to refresh metadata');
@@ -1082,6 +1153,177 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
   };
 
   // Step 4 & 5: Toggle CDS Selection with real-time field and join synchronization
+  const getComponentExtractionStatus = (candidate: any, viewName: string) => {
+    return (candidate?.component_extraction_statuses || []).find(
+      (status: any) => status.cds_name?.toUpperCase() === viewName.toUpperCase()
+    );
+  };
+
+  const openWrapperForm = (sourceName: string) => {
+    setWrapperSourceName(sourceName);
+    setWrapperSqlViewName('');
+    setWrapperLabel('');
+    setWrapperCdsName('');
+    setWrapperPackage('');
+    setWrapperTransportRequest('');
+    setWrapperGenerationResult(null);
+    setWrapperValidationResult(null);
+    setWrapperCreationResult(null);
+    setWrapperActivationResult(null);
+    setWrapperActionError('');
+    setWrapperModalOpen(true);
+  };
+
+  const handleGenerateExtractionWrapper = async () => {
+    if (!wrapperSourceName || !wrapperSqlViewName.trim() || !wrapperLabel.trim() || !wrapperCdsName.trim()) {
+      setWrapperActionError('Complete all four required inputs before generating the wrapper.');
+      return;
+    }
+    setIsGeneratingWrapper(true);
+    setWrapperActionError('');
+    setWrapperValidationResult(null);
+    setWrapperCreationResult(null);
+    try {
+      const result = await generateWrapperCode({
+        requirement: requirementText,
+        selected_views: [wrapperSourceName],
+        mappings: [],
+        join_paths: [],
+        output_fields: [],
+        artifact_name: wrapperCdsName.trim(),
+        wrapper_label: wrapperLabel.trim(),
+        sql_view_name: wrapperSqlViewName.trim(),
+        join_configuration_approved: true,
+      });
+      if (!result?.success || !result?.code) {
+        throw new Error(result?.errors?.join(' ') || 'Wrapper generation failed validation.');
+      }
+      setWrapperGenerationResult(result);
+    } catch (error: any) {
+      setWrapperActionError(error?.message || 'Wrapper generation failed.');
+    } finally {
+      setIsGeneratingWrapper(false);
+    }
+  };
+
+  const handleValidateExtractionWrapper = async () => {
+    if (!wrapperGenerationResult?.code) return;
+    setIsValidatingWrapper(true);
+    setWrapperActionError('');
+    try {
+      const result = await validateWrapperCode({
+        code: wrapperGenerationResult.code,
+        source_cds_view_name: wrapperSourceName,
+        sql_view_name: wrapperSqlViewName.trim(),
+        wrapper_label: wrapperLabel.trim(),
+        wrapper_cds_name: wrapperCdsName.trim(),
+      });
+      setWrapperValidationResult(result);
+      if (!result.valid) setWrapperActionError(result.errors?.join(' ') || 'Wrapper validation failed.');
+    } catch (error: any) {
+      setWrapperActionError(error?.message || 'Wrapper validation failed.');
+    } finally {
+      setIsValidatingWrapper(false);
+    }
+  };
+
+  const handleVerifyWrapperTransport = async () => {
+    if (!wrapperTransportRequest.trim()) return;
+    setWrapperTransportVerified(false);
+    setWrapperActionError('');
+    try {
+      const capability = await fetchWrapperWriteCapability(wrapperTransportRequest.trim());
+      const verified = capability.write_enabled && (capability.eligible_transports || []).some(
+        (transport) => transport.number.toUpperCase() === wrapperTransportRequest.trim().toUpperCase()
+      );
+      setWrapperWriteCapability({ ...capability, selected_transport_valid: verified });
+      setWrapperTransportVerified(verified);
+      if (!verified) setWrapperActionError(capability.reason || 'SAP ADT did not verify this as an eligible Workbench request.');
+    } catch (error: any) {
+      setWrapperWriteCapability({ write_enabled: false, selected_transport_valid: false, reason: error?.message || 'SAP transport verification failed.' });
+      setWrapperActionError(error?.message || 'SAP transport verification failed.');
+    }
+  };
+
+  const handleCreateExtractionWrapper = async () => {
+    if (!wrapperValidationResult?.valid || !wrapperGenerationResult?.code) return;
+    if (!wrapperTransportVerified) {
+      setWrapperActionError('Verify the selected Workbench transport with SAP ADT before creating the CDS object.');
+      return;
+    }
+    try {
+      const capability = await fetchWrapperWriteCapability(wrapperTransportRequest.trim());
+      const chosenTransportIsEligible = (capability.eligible_transports || []).some(
+        (transport: any) => transport.number?.toUpperCase() === wrapperTransportRequest.trim().toUpperCase()
+      );
+      const currentCapability = { ...capability, selected_transport_valid: chosenTransportIsEligible };
+      setWrapperWriteCapability(currentCapability);
+      if (!capability.write_enabled || !chosenTransportIsEligible) {
+        setWrapperActionError(capability.reason || 'Select a currently eligible Workbench transport returned by SAP ADT.');
+        return;
+      }
+    } catch (error: any) {
+      setWrapperActionError(error?.message || 'Could not verify SAP write mode.');
+      return;
+    }
+    const confirmed = window.confirm(
+      `Create CDS wrapper ${wrapperCdsName.trim()} in connected SAP S/4HANA system?\n\nPackage: ${wrapperPackage.trim()}\nTransport: ${wrapperTransportRequest.trim()}\n\nThis creates an inactive repository object and uploads the validated source. It will not activate the object.`
+    );
+    if (!confirmed) return;
+    setIsCreatingWrapper(true);
+    setWrapperActionError('');
+    try {
+      const result = await createWrapperInSap({
+        code: wrapperGenerationResult.code,
+        source_cds_view_name: wrapperSourceName,
+        sql_view_name: wrapperSqlViewName.trim(),
+        wrapper_label: wrapperLabel.trim(),
+        wrapper_cds_name: wrapperCdsName.trim(),
+        package: wrapperPackage.trim(),
+        transport_request: wrapperTransportRequest.trim(),
+        confirmed: true,
+      });
+      setWrapperCreationResult(result);
+    } catch (error: any) {
+      setWrapperActionError(error?.message || 'SAP CDS creation failed.');
+    } finally {
+      setIsCreatingWrapper(false);
+    }
+  };
+
+  const handleActivateExtractionWrapper = async () => {
+    if (!wrapperCreationResult?.success) return;
+    const confirmed = window.confirm(
+      `Activate ${wrapperCdsName.trim()} in SAP now? This is a separate SAP change and will run the ADT activation operation.`
+    );
+    if (!confirmed) return;
+    setIsActivatingWrapper(true);
+    setWrapperActionError('');
+    try {
+      const result = await activateWrapperInSap({
+        wrapper_cds_name: wrapperCdsName.trim(),
+        transport_request: wrapperTransportRequest.trim(),
+        confirmed: true,
+      });
+      setWrapperActivationResult(result);
+    } catch (error: any) {
+      setWrapperActionError(error?.message || 'SAP CDS activation failed. The created object remains in SAP.');
+    } finally {
+      setIsActivatingWrapper(false);
+    }
+  };
+
+  const handleDownloadExtractionWrapper = () => {
+    if (!wrapperGenerationResult?.code) return;
+    const sourceBlob = new Blob([wrapperGenerationResult.code], { type: 'text/plain;charset=utf-8' });
+    const sourceUrl = URL.createObjectURL(sourceBlob);
+    const link = document.createElement('a');
+    link.href = sourceUrl;
+    link.download = `${wrapperCdsName.trim()}.abap`;
+    link.click();
+    URL.revokeObjectURL(sourceUrl);
+  };
+
   const toggleCandidateSelection = (cand: any) => {
     const candId = getCandidateId(cand);
     let newSelectedIds: string[];
@@ -1590,6 +1832,41 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
           <div>
             <div className="flex flex-wrap items-center gap-2">
               <span className="font-mono text-sm font-bold text-[#0F2747]">{cand.cds_name}</span>
+              {Array.isArray(cand.component_extraction_statuses) && cand.component_extraction_statuses.length > 0 && (
+                <div className="basis-full mt-1 rounded-lg border border-[#D9E4F0] bg-[#F8FAFC] p-2.5">
+                  <div className="mb-1.5 text-[10px] font-bold uppercase tracking-wider text-[#5F7187]">CDS View Extraction Status</div>
+                  <ol className="space-y-1.5">
+                    {cand.component_extraction_statuses.map((component: any) => (
+                      <li key={component.cds_name} className="text-[11px]">
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <span className="font-mono font-semibold text-[#0F2747]">{component.cds_name}</span>
+                          <span className={`rounded border px-1.5 py-0.5 font-bold ${
+                            component.status === 'TRUE' ? 'border-emerald-300 bg-emerald-100 text-emerald-800' :
+                            component.status === 'FALSE' ? 'border-gray-300 bg-gray-100 text-gray-700' :
+                            'border-amber-300 bg-amber-100 text-amber-800'
+                          }`}>
+                            Data Extraction Enabled: {component.status || 'UNKNOWN'}
+                          </span>
+                        </div>
+                        <div className="ml-3 mt-0.5 space-y-0.5 text-[10px] text-[#5F7187]">
+                          {(component.evidence || []).map((evidence: string, index: number) => (
+                            <div key={`${component.cds_name}-evidence-${index}`}>• {evidence}</div>
+                          ))}
+                        </div>
+                        {component.can_create_extraction_wrapper === true && (
+                          <button
+                            type="button"
+                            onClick={(event) => { event.stopPropagation(); openWrapperForm(component.cds_name); }}
+                            className="ml-3 mt-1 rounded-lg bg-[#0A6ED1] px-2.5 py-1 text-[10px] font-bold text-white hover:bg-[#085CAF]"
+                          >
+                            Create Extraction Wrapper
+                          </button>
+                        )}
+                      </li>
+                    ))}
+                  </ol>
+                </div>
+              )}
               <span className="text-[10px] bg-emerald-50 text-emerald-700 font-bold px-2 py-0.5 rounded-md border border-emerald-300 flex items-center gap-1">
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
                 CDS Enabled
@@ -1604,7 +1881,7 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
                 Non-Parameterized
               </span>
               {/* Authoritative SAP Data Extraction Badges */}
-              {cand.data_extraction_enabled ? (
+              {cand.type !== 'Multi CDS' && (cand.data_extraction_enabled ? (
                 <span
                   className="text-[10px] bg-emerald-100 text-emerald-800 font-bold px-2 py-0.5 rounded-md border border-emerald-300 flex items-center gap-1 shadow-2xs"
                   title={cand.extraction_details || "Verified in SAP I_DataExtractionEnabledView"}
@@ -1619,7 +1896,7 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
                 >
                   Extraction: Disabled
                 </span>
-              ) : null}
+              ) : null)}
               {cand.delta_cdc_supported && (
                 <span
                   className="text-[10px] bg-purple-100 text-purple-800 font-bold px-2 py-0.5 rounded-md border border-purple-300 flex items-center gap-1 shadow-2xs"
@@ -2032,10 +2309,18 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
                     <div>
                       <div className="font-mono text-xs text-[#0A6ED1] font-semibold">{r.cds_name}</div>
                       <div className="text-[10px] text-[#5F7187]">{r.description}</div>
+                      <div className="text-[10px] text-[#5F7187]">Data Extraction Enabled: {r.component_extraction_statuses?.[0]?.status || 'UNKNOWN'}</div>
                     </div>
-                    <span className="text-[10px] bg-[#F4F8FC] border border-[#D9E4F0] text-[#0A6ED1] px-2 py-0.5 rounded font-mono font-medium">
-                      {r.total_fields} Fields
-                    </span>
+                    <div className="flex items-center gap-2">
+                      <span className="text-[10px] bg-[#F4F8FC] border border-[#D9E4F0] text-[#0A6ED1] px-2 py-0.5 rounded font-mono font-medium">
+                        {r.total_fields} Fields
+                      </span>
+                      {r.can_create_extraction_wrapper === true && (
+                        <button type="button" onClick={(event) => { event.stopPropagation(); openWrapperForm(r.cds_name); }} className="rounded bg-[#0A6ED1] px-2 py-1 text-[10px] font-bold text-white">
+                          Create Extraction Wrapper
+                        </button>
+                      )}
+                    </div>
                   </div>
                 ))}
               </div>
@@ -5475,6 +5760,144 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
 
       {/* 4. MODALS */}
 
+      {wrapperModalOpen && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 p-4">
+          <div className="flex max-h-[92vh] w-full max-w-4xl flex-col overflow-hidden rounded-2xl border border-[#D9E4F0] bg-white shadow-2xl">
+            <div className="flex items-center justify-between border-b border-[#D9E4F0] bg-[#F4F8FC] px-5 py-4">
+              <div>
+                <h2 className="text-sm font-bold text-[#0F2747]">Create Extraction Wrapper</h2>
+                <p className="mt-1 text-xs text-[#5F7187]">Original CDS status remains unchanged. The wrapper is generated for review only.</p>
+              </div>
+              <button type="button" onClick={() => setWrapperModalOpen(false)} className="rounded p-1 text-[#5F7187] hover:bg-white" aria-label="Close wrapper form">
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <div className="overflow-y-auto p-5">
+              <div className="mb-4 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900">
+                <div className="font-bold">Selected CDS View: <span className="font-mono">{wrapperSourceName}</span></div>
+              {wrapperWriteCapability?.write_enabled === false && (
+                <div className="mt-3 rounded-lg border border-amber-300 bg-amber-50 p-2.5 text-xs text-amber-900">
+                  SAP repository creation is blocked: {wrapperWriteCapability.reason || 'SAP write mode is disabled by server configuration.'}
+                </div>
+              )}
+              {wrapperWriteCapability?.write_enabled === true && wrapperWriteCapability?.repository_permission_verified === false && (
+                <div className="mt-3 rounded-lg border border-sky-200 bg-sky-50 p-2.5 text-xs text-sky-900">
+                  SAP target and development transport are verified. Repository write authorization is enforced by SAP on Create CDS; SAP permission failures will be shown as errors, and the object is reported created only after ADT read-back.
+                </div>
+              )}
+                <div className="mt-1">Data Extraction Enabled: <strong>UNKNOWN</strong></div>
+              </div>
+
+              <div className="grid gap-3 md:grid-cols-2">
+                <label className="space-y-1 text-xs font-semibold text-[#0F2747]">
+                  <span>SQL View Name <span className="text-red-600">*</span></span>
+                  <input required value={wrapperSqlViewName} onChange={(event) => { setWrapperSqlViewName(event.target.value); setWrapperValidationResult(null); setWrapperCreationResult(null); }} maxLength={16} className="w-full rounded-lg border border-[#B8C7D9] px-3 py-2 font-mono font-normal uppercase" placeholder="Enter unique SQL view name" />
+                </label>
+                <label className="space-y-1 text-xs font-semibold text-[#0F2747]">
+                  <span>User-Provided Label <span className="text-red-600">*</span></span>
+                  <input required value={wrapperLabel} onChange={(event) => { setWrapperLabel(event.target.value); setWrapperValidationResult(null); setWrapperCreationResult(null); }} maxLength={60} className="w-full rounded-lg border border-[#B8C7D9] px-3 py-2 font-normal" placeholder="Enter a label for the wrapper" />
+                </label>
+                <label className="space-y-1 text-xs font-semibold text-[#0F2747]">
+                  <span>Wrapper CDS Name <span className="text-red-600">*</span></span>
+                  <input required value={wrapperCdsName} onChange={(event) => { setWrapperCdsName(event.target.value); setWrapperValidationResult(null); setWrapperCreationResult(null); }} maxLength={30} className="w-full rounded-lg border border-[#B8C7D9] px-3 py-2 font-mono font-normal" placeholder="Enter a Z or Y CDS name" />
+                </label>
+                <label className="space-y-1 text-xs font-semibold text-[#0F2747]">
+                  <span>SAP Package <span className="text-red-600">*</span></span>
+                  <input required value={wrapperPackage} onChange={(event) => { setWrapperPackage(event.target.value); setWrapperValidationResult(null); setWrapperCreationResult(null); }} maxLength={30} className="w-full rounded-lg border border-[#B8C7D9] px-3 py-2 font-mono font-normal" placeholder="Enter an existing SAP package" />
+                </label>
+                <label className="space-y-1 text-xs font-semibold text-[#0F2747]">
+                  <span>Workbench Transport Request <span className="text-red-600">*</span></span>
+                  <div className="flex gap-2">
+                    <input required value={wrapperTransportRequest} onChange={(event) => { setWrapperTransportRequest(event.target.value.toUpperCase()); setWrapperTransportVerified(false); setWrapperWriteCapability((current: any) => current ? { ...current, selected_transport_valid: false } : current); setWrapperCreationResult(null); }} maxLength={10} className="min-w-0 flex-1 rounded-lg border border-[#B8C7D9] px-3 py-2 font-mono font-normal" placeholder="Enter a Workbench request from SAP" />
+                    <button type="button" onClick={handleVerifyWrapperTransport} disabled={!wrapperTransportRequest.trim() || wrapperTransportRequest.trim().length !== 10} className="rounded bg-[#0F2747] px-3 py-2 text-[11px] font-bold text-white disabled:cursor-not-allowed disabled:opacity-40">{wrapperWriteCapability?.selected_transport_valid ? 'Verified' : 'Verify Transport'}</button>
+                  </div>
+                  {wrapperTransportVerified && wrapperWriteCapability?.selected_transport?.description && <p className="mt-1 text-[11px] text-emerald-800">SAP verified: {wrapperWriteCapability.selected_transport.number} — {wrapperWriteCapability.selected_transport.description}</p>}
+                  {wrapperWriteCapability?.reason && <p className="mt-1 text-[11px] text-amber-800">{wrapperWriteCapability.reason}</p>}
+                </label>
+                <label className="space-y-1 text-xs font-semibold text-[#0F2747]">
+                  <span>Source CDS View Name</span>
+                  <input required readOnly value={wrapperSourceName} className="w-full cursor-not-allowed rounded-lg border border-[#B8C7D9] bg-gray-100 px-3 py-2 font-mono font-normal text-[#52667F]" />
+                </label>
+              </div>
+
+              {wrapperActionError && <div className="mt-3 rounded-lg border border-red-200 bg-red-50 p-2.5 text-xs text-red-800">{wrapperActionError}</div>}
+
+              <div className="mt-4 flex justify-end">
+                <button
+                  type="button"
+                  onClick={handleGenerateExtractionWrapper}
+                  disabled={isGeneratingWrapper || !wrapperSqlViewName.trim() || !wrapperLabel.trim() || !wrapperCdsName.trim()}
+                  className="rounded-lg bg-[#0A6ED1] px-4 py-2 text-xs font-bold text-white hover:bg-[#085CAF] disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  {isGeneratingWrapper ? 'Validating and Generating…' : 'Generate Wrapper'}
+                </button>
+              </div>
+
+              {wrapperGenerationResult?.success && (
+                <section className="mt-5 space-y-3 border-t border-[#D9E4F0] pt-5">
+                  <div>
+                    <h3 className="text-sm font-bold text-[#0F2747]">Extraction Wrapper Generated</h3>
+                    <div className="mt-2 grid gap-2 rounded-lg bg-[#F8FAFC] p-3 text-xs md:grid-cols-2">
+                      <div>Source CDS View: <span className="font-mono font-semibold">{wrapperSourceName}</span></div>
+                      <div>Wrapper CDS View: <span className="font-mono font-semibold">{wrapperCdsName}</span></div>
+                      <div>SQL View Name: <span className="font-mono font-semibold">{wrapperSqlViewName.toUpperCase()}</span></div>
+                      <div>Label: <span className="font-semibold">{wrapperLabel}</span></div>
+                      <div>Extraction Enabled: <strong>TRUE</strong> <span className="text-[#5F7187]">(wrapper annotation; SAP validation pending)</span></div>
+                      <div>CDC Automatic: <strong>TRUE</strong> <span className="text-[#5F7187]">(compatibility not yet validated)</span></div>
+                      <div>SAP Activation Status: <strong>NOT ACTIVATED</strong></div>
+                    </div>
+                    {wrapperGenerationResult.validation?.live_sap_connection_available === false && (
+                      <p className="mt-2 text-[11px] text-amber-800">Live SAP ADT was unreachable. Source and name checks used indexed SAP ADT metadata; verify against SAP before use.</p>
+                    )}
+                  </div>
+
+                  <div className="overflow-hidden rounded-xl border border-[#D9E4F0]">
+                    <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#D9E4F0] bg-[#F4F8FC] px-3 py-2">
+                      <span className="text-xs font-bold text-[#0F2747]">Generated ABAP CDS Source</span>
+                      <div className="flex gap-2">
+                        <button type="button" onClick={async () => { try { await navigator.clipboard.writeText(wrapperGenerationResult.code); } catch { setWrapperActionError('Could not copy source to clipboard.'); } }} className="rounded border border-[#B8C7D9] bg-white px-2.5 py-1 text-[11px] font-semibold">Copy Source</button>
+                        <button type="button" onClick={handleDownloadExtractionWrapper} className="rounded border border-[#B8C7D9] bg-white px-2.5 py-1 text-[11px] font-semibold">Download Source</button>
+                        <button type="button" onClick={handleValidateExtractionWrapper} disabled={isValidatingWrapper || isCreatingWrapper} className="rounded bg-[#0F2747] px-2.5 py-1 text-[11px] font-semibold text-white disabled:opacity-50">{isValidatingWrapper ? 'Validating…' : 'Validate Wrapper'}</button>
+                        {wrapperValidationResult && <button type="button" onClick={handleCreateExtractionWrapper} disabled={!wrapperValidationResult.valid || !wrapperPackage.trim() || !wrapperTransportRequest.trim() || wrapperWriteCapability?.write_enabled !== true || wrapperWriteCapability?.selected_transport_valid !== true || !wrapperTransportVerified || isCreatingWrapper || isValidatingWrapper} title={wrapperValidationResult.valid ? (wrapperWriteCapability?.reason || (!wrapperTransportVerified ? 'Verify the selected SAP ADT Workbench transport.' : '')) : (wrapperValidationResult.errors?.join(' ') || 'Wrapper validation failed.')} className="rounded bg-[#0A6ED1] px-2.5 py-1 text-[11px] font-semibold text-white disabled:cursor-not-allowed disabled:opacity-40">{isCreatingWrapper ? 'Creating in SAP…' : 'Create CDS'}</button>}
+                      </div>
+                    </div>
+                    <pre className="max-h-[38vh] overflow-auto bg-[#0F2747] p-4 font-mono text-xs leading-relaxed text-[#00A878]">{wrapperGenerationResult.code}</pre>
+                  </div>
+                  {wrapperValidationResult && (
+                    <div className={`mt-2 rounded-lg border p-2 text-[11px] ${wrapperValidationResult.valid ? 'border-emerald-300 bg-emerald-50 text-emerald-800' : 'border-red-300 bg-red-50 text-red-800'}`}>
+                      <div className="font-bold">{wrapperValidationResult.valid ? 'Validation passed' : 'Validation failed'}</div>
+                      {(wrapperValidationResult.errors || []).map((error: string, index: number) => <div key={index}>{error}</div>)}
+                    </div>
+                  )}
+                  {wrapperCreationResult?.success && (
+                    <div className="mt-3 space-y-2 rounded-xl border border-emerald-300 bg-emerald-50 p-3 text-xs text-emerald-900">
+                      <div className="font-bold">CDS Object Created Successfully</div>
+                      <div>Source CDS View: <span className="font-mono font-semibold">{wrapperCreationResult.source_cds_view_name}</span></div>
+                      <div>Created Wrapper CDS: <span className="font-mono font-semibold">{wrapperCreationResult.created_object_name}</span></div>
+                      <div>SQL View Name: <span className="font-mono font-semibold">{wrapperCreationResult.sql_view_name}</span></div>
+                      <div>SAP System: {wrapperCreationResult.sap_system}</div>
+                      <div>Creation Status: <span className="font-bold">{wrapperCreationResult.creation_status}</span></div>
+                      <div>Activation Status: <span className="font-bold">{wrapperActivationResult ? (wrapperActivationResult.success ? 'ACTIVE (SAP CONFIRMED)' : 'NOT ACTIVATED') : wrapperCreationResult.activation_status}</span></div>
+                      {wrapperCreationResult.adt_response && <details className="md:col-span-2"><summary className="cursor-pointer font-bold">SAP ADT response and independent GET verification</summary><pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap rounded bg-white p-2 font-mono text-[10px]">{JSON.stringify(wrapperCreationResult.adt_response, null, 2)}</pre></details>}
+                      {wrapperCreationResult.object_url && <a className="mr-3 inline-block underline" href={wrapperCreationResult.object_url} target="_blank" rel="noreferrer">Open SAP ADT Object</a>}
+                      <button type="button" onClick={handleActivateExtractionWrapper} disabled={isActivatingWrapper} className="rounded bg-amber-700 px-2.5 py-1 text-[11px] font-semibold text-white disabled:opacity-50">{isActivatingWrapper ? 'Activating…' : 'Activate CDS…'}</button>
+                      {wrapperActivationResult && <pre className="whitespace-pre-wrap text-[10px]">{JSON.stringify(wrapperActivationResult.messages || wrapperActivationResult, null, 2)}</pre>}
+                    </div>
+                  )}
+                  {wrapperValidationResult && (
+                    <div className={`rounded-lg border p-2.5 text-xs ${wrapperValidationResult.valid ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-red-200 bg-red-50 text-red-800'}`}>
+                      {wrapperValidationResult.valid ? wrapperValidationResult.message : wrapperValidationResult.errors?.join(' ')}
+                    </div>
+                  )}
+                  <p className="text-[11px] text-[#5F7187]">Original CDS extraction status remains UNKNOWN. No SAP object was activated or deployed. Actual CDC compatibility requires SAP validation.</p>
+                </section>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* View Details Modal (Section 21) */}
       {detailsModalItem && (
         <div className="fixed inset-0 z-50 bg-[#0F2747]/40 backdrop-blur-xs flex items-center justify-center p-4">
@@ -5489,6 +5912,28 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
               </button>
             </div>
             <div className="p-4 overflow-y-auto space-y-4 flex-1 text-xs text-[#172B4D]">
+              {(() => {
+                const candidate = allCandidates.find((item: any) =>
+                  (item.component_extraction_statuses || []).some((status: any) => status.cds_name?.toUpperCase() === detailsModalItem.cds_name?.toUpperCase())
+                );
+                const extraction = detailsModalItem.component_extraction_statuses?.find((status: any) => status.cds_name?.toUpperCase() === detailsModalItem.cds_name?.toUpperCase())
+                  || (candidate && getComponentExtractionStatus(candidate, detailsModalItem.cds_name));
+                return (
+                  <div className="rounded-lg border border-[#D9E4F0] bg-[#F8FAFC] p-3">
+                    <div className="font-bold text-[#0F2747]">Selected CDS View: <span className="font-mono">{detailsModalItem.cds_name}</span></div>
+                    <div className="mt-1">Data Extraction Enabled: <strong>{extraction?.status || 'UNKNOWN'}</strong></div>
+                    {extraction?.can_create_extraction_wrapper === true && (
+                      <button
+                        type="button"
+                        onClick={() => openWrapperForm(detailsModalItem.cds_name)}
+                        className="mt-2 rounded-lg bg-[#0A6ED1] px-3 py-1.5 text-[11px] font-bold text-white hover:bg-[#085CAF]"
+                      >
+                        Create Extraction Wrapper
+                      </button>
+                    )}
+                  </div>
+                );
+              })()}
               <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
                 <div className="bg-[#F4F8FC] p-2 rounded-lg border border-[#D9E4F0]">
                   <span className="text-[#5F7187]">Domain:</span> <span className="font-semibold">{detailsModalItem.domain}</span>

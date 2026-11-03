@@ -49,6 +49,7 @@ async def get_cds_view_metadata(view_name: str):
 
 from pydantic import BaseModel
 from src.services.discovery_service import CDSDiscoveryService
+from src.services.extraction_wrapper_policy import can_create_extraction_wrapper
 
 discovery_svc = CDSDiscoveryService()
 
@@ -76,12 +77,22 @@ async def refresh_metadata():
 
 @router.get("/direct-search", summary="Direct search across indexed CDS views")
 async def direct_search(q: str = Query(..., min_length=1)):
-    return await discovery_svc.direct_search(q)
+    results = await discovery_svc.direct_search(q)
+    if isinstance(results, list):
+        for item in results:
+            if isinstance(item, dict) and item.get("cds_name"):
+                status = await discovery_svc.get_verified_component_extraction_status(
+                    item["cds_name"], allow_live_source_retrieval=False
+                )
+                item["component_extraction_statuses"] = [status]
+                item["can_create_extraction_wrapper"] = can_create_extraction_wrapper(status)
+    return results
 
 
 @router.get("/view-details/{view_name}", summary="Full details for one CDS view")
 async def get_view_details_full(view_name: str):
     details = await discovery_svc.get_view_details(view_name)
+    extraction_status = await discovery_svc.get_verified_component_extraction_status(view_name)
     if not details:
         return {
             "cds_name": view_name,
@@ -97,7 +108,11 @@ async def get_view_details_full(view_name: str):
             "odata_available": False,
             "odata_status": "Unknown",
             "odata_annotation": "Not available from current ADT metadata.",
+            "component_extraction_statuses": [extraction_status],
+            "can_create_extraction_wrapper": can_create_extraction_wrapper(extraction_status),
         }
+    details["component_extraction_statuses"] = [extraction_status]
+    details["can_create_extraction_wrapper"] = can_create_extraction_wrapper(extraction_status)
     return details
 
 
@@ -126,29 +141,14 @@ async def run_discovery_pipeline(payload: DiscoveryRunPayload):
 
 @router.get("/extraction-status/{view_name}", summary="Checks authoritative data extraction enabled status for a CDS view")
 async def get_view_extraction_status(view_name: str):
-    """Returns authoritative data extraction metadata from I_DataExtractionEnabledView for target CDS view."""
-    meta = await discovery_svc.get_authoritative_extraction_metadata()
-    if not meta.get("success"):
-        return {
-            "cds_name": view_name,
-            "extraction_status": "UNVERIFIED",
-            "data_extraction_enabled": False,
-            "error": meta.get("error"),
-        }
-    rec = meta.get("records", {}).get(view_name.strip().upper())
-    if rec:
-        return {
-            "cds_name": view_name,
-            "extraction_status": "VERIFIED_ENABLED",
-            "data_extraction_enabled": True,
-            "description": rec.get("description"),
-            "is_sap_released_view": rec.get("is_sap_released"),
-            "delta_cdc_supported": rec.get("delta_cdc_supported"),
-        }
+    """Returns per-view status only when source and SAP catalog evidence agree."""
+    evidence = await discovery_svc.get_verified_component_extraction_status(view_name)
+    status = evidence.get("status", "UNKNOWN")
     return {
-        "cds_name": view_name,
-        "extraction_status": "VERIFIED_NOT_ENABLED" if meta.get("is_complete") else "UNVERIFIED",
-        "data_extraction_enabled": False,
+        **evidence,
+        "extraction_status": "VERIFIED_ENABLED" if status == "TRUE" else "VERIFIED_NOT_ENABLED" if status == "FALSE" else "UNVERIFIED",
+        "data_extraction_enabled": True if status == "TRUE" else False if status == "FALSE" else None,
+        "can_create_extraction_wrapper": can_create_extraction_wrapper(evidence),
     }
 
 

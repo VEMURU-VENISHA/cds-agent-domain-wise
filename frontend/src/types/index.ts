@@ -139,7 +139,17 @@ export interface CDSCandidate {
   delta_cdc_supported?: boolean;
   is_sap_released_view?: boolean;
   extraction_details?: string;
-  component_extraction_statuses?: Record<string, string>;
+  component_extraction_statuses?: ComponentExtractionStatus[];
+}
+
+export interface ComponentExtractionStatus {
+  cds_name: string;
+  status: 'TRUE' | 'FALSE' | 'UNKNOWN';
+  annotation_status: 'TRUE' | 'FALSE' | 'UNKNOWN';
+  sap_metadata_status: 'TRUE' | 'FALSE' | 'UNKNOWN';
+  evidence: string[];
+  sap_description?: string;
+  can_create_extraction_wrapper?: boolean;
 }
 
 export interface ExtractionFilteringStats {
@@ -155,7 +165,13 @@ export interface ExtractionFilteringStats {
 export interface ExtractionStatusResult {
   cds_name: string;
   extraction_status: 'VERIFIED_ENABLED' | 'VERIFIED_NOT_ENABLED' | 'UNVERIFIED' | string;
-  data_extraction_enabled: boolean;
+  data_extraction_enabled: boolean | null;
+  status?: 'TRUE' | 'FALSE' | 'UNKNOWN';
+  can_create_extraction_wrapper?: boolean;
+  annotation_status?: 'TRUE' | 'FALSE' | 'UNKNOWN';
+  sap_metadata_status?: 'TRUE' | 'FALSE' | 'UNKNOWN';
+  evidence?: string[];
+  sap_description?: string;
   description?: string;
   is_sap_released_view?: boolean;
   delta_cdc_supported?: boolean;

@@ -33,7 +33,7 @@ def register_exception_handlers(app: FastAPI) -> None:
         correlation_id = getattr(request.state, "correlation_id", "unknown")
         logger.warning(f"[{correlation_id}] Request Validation Error: {exc.errors()}")
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=getattr(status, "HTTP_422_UNPROCESSABLE_CONTENT", 422),
             content={
                 "error": {
                     "code": "VALIDATION_ERROR",
