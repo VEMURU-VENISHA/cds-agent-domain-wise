@@ -640,6 +640,9 @@ export interface ViewWrapperFieldMapping {
 export interface ViewWrapperMappingItem {
   source_cds_view: string;
   source_label: string;
+  data_extraction_status?: 'TRUE' | 'FALSE' | 'UNKNOWN';
+  result?: string;
+  can_create_wrapper?: boolean;
   package: string;
   wrapper_cds_view: string;
   wrapper_sql_view_name: string;

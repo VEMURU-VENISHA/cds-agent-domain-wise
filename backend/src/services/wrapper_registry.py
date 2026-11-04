@@ -47,16 +47,6 @@ def ensure_wrappers_table(conn: Optional[sqlite3.Connection] = None):
                 PRIMARY KEY (source_cds_name, wrapper_cds_name)
             )
         """)
-        initial_wrappers = [
-            ("I_BILLINGDOCUMENTITEM", "ZC_DATAWRAPPER1", "ZASDF", "ZTRAINING_2026", "S3XK911848", "CREATED", "ACTIVE", "2026-11-03 12:37:56"),
-            ("I_JOURNALENTRYITEM", "ZC_DATAWRAPPER", "ZCDATAWRAP", "ZTRAINING_2026", "S3XK911848", "CREATED", "INACTIVE", "2026-11-03 12:28:23"),
-        ]
-        for row in initial_wrappers:
-            c.execute("""
-                INSERT OR IGNORE INTO cds_wrappers 
-                (source_cds_name, wrapper_cds_name, sql_view_name, package, transport_request, creation_status, activation_status, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, row)
         conn.commit()
     finally:
         if should_close:

@@ -5022,320 +5022,67 @@ export const RecentPipelines: React.FC<Props> = ({ onPipelineExecuted, onDecisio
 
       {/* STEP 2: MAPPING DISPLAY (CDS Selection → Mapping Display Workflow) */}
       {activeStep === 5 && (
-        <div className="bg-white border border-[#D9E4F0] rounded-2xl p-6 space-y-6 shadow-sm">
-          {/* Header Bar */}
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between pb-4 border-b border-[#D9E4F0] gap-3">
+        <section className="space-y-5 rounded-2xl border border-[#D9E4F0] bg-white p-5 shadow-sm">
+          <header className="flex flex-wrap items-start justify-between gap-4">
             <div>
-              <div className="flex items-center gap-2">
-                <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider bg-blue-100 text-[#0A6ED1] border border-blue-200">
-                  Step 2
-                </span>
-                <h2 className="text-base font-bold text-[#0F2747]">Mapping Display &amp; CDS Wrapper Status</h2>
-              </div>
-              <p className="text-xs text-[#5F7187] mt-1">
-                Authoritative mapping of Selected Original CDS Views, Corresponding Wrapper Views, and SAP Technical Fields.
-              </p>
+              <p className="text-[10px] font-bold uppercase tracking-wider text-[#0A6ED1]">Step 2</p>
+              <h2 className="text-base font-bold text-[#0F2747]">Mapping Results</h2>
+              <p className="mt-1 text-xs text-[#5F7187]">Selected CDS views and their authoritative extraction and wrapper status.</p>
             </div>
+            <div className="flex items-center gap-2 text-xs">
+              <span className="rounded-full border border-[#D9E4F0] bg-[#F4F8FC] px-3 py-1 font-mono font-medium text-[#0A6ED1]">
+                {viewsWrapperMappings.length || selectedViews.length} Selected CDS Views
+              </span>
+              <span className="rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 font-mono font-medium text-emerald-700">
+                {viewsWrapperMappings.filter((view) => view.data_extraction_status === 'UNKNOWN' && view.wrapper_cds_view !== 'Not Created' && view.wrapper_cds_view !== 'Not Required').length} Wrappers Created
+              </span>
+            </div>
+          </header>
 
-            <div className="flex items-center gap-3">
-              <div className="flex items-center gap-2 text-xs">
-                <span className="bg-[#F4F8FC] border border-[#D9E4F0] text-[#0A6ED1] px-3 py-1 rounded-full font-mono font-medium">
-                  {viewsWrapperMappings.length || selectedViews.length} Selected View(s)
-                </span>
-                <span className="bg-emerald-50 border border-emerald-200 text-emerald-700 px-3 py-1 rounded-full font-mono font-medium">
-                  {viewsWrapperMappings.filter((m) => m.wrapper_cds_view !== 'Not Created').length} Wrapped
-                </span>
-              </div>
-              <button
-                type="button"
-                onClick={() => {
-                  if (selectedViews.length > 0) {
-                    void loadViewsWrapperMappings(selectedViews);
-                  }
-                }}
-                disabled={isLoadingMappings}
-                className="px-3 py-1.5 rounded-lg border border-[#D9E4F0] hover:bg-[#F4F8FC] text-xs font-semibold text-[#0F2747] flex items-center gap-1.5 transition shadow-2xs"
-                title="Refresh wrapper metadata from SAP backend"
-              >
-                <RefreshCw className={`w-3.5 h-3.5 text-[#0A6ED1] ${isLoadingMappings ? 'animate-spin' : ''}`} />
-                Refresh
-              </button>
+          {isLoadingMappings ? (
+            <div className="rounded-xl border border-[#D9E4F0] bg-[#F4F8FC] p-8 text-center text-xs text-[#5F7187]">
+              <Loader2 className="mx-auto mb-2 h-6 w-6 animate-spin text-[#0A6ED1]" />
+              Retrieving CDS extraction and wrapper status…
             </div>
-          </div>
-
-          {/* Loading indicator */}
-          {isLoadingMappings && viewsWrapperMappings.length === 0 && (
-            <div className="p-8 text-center bg-[#F4F8FC] border border-[#D9E4F0] rounded-2xl space-y-3">
-              <Loader2 className="w-8 h-8 text-[#0A6ED1] animate-spin mx-auto" />
-              <div className="text-xs font-semibold text-[#0F2747]">
-                Retrieving Authoritative CDS Wrapper Metadata &amp; Field Mappings…
-              </div>
-              <p className="text-[11px] text-[#5F7187]">
-                Querying SAP metadata catalog and registered repository wrappers.
-              </p>
+          ) : viewsWrapperMappings.length > 0 ? (
+            <div className="overflow-x-auto rounded-xl border border-[#D9E4F0]">
+              <table className="w-full text-left text-xs">
+                <thead className="bg-[#F4F8FC] text-[#0F2747]"><tr>
+                  <th className="p-3 font-semibold">Selected CDS View</th>
+                  <th className="p-3 font-semibold">Data Extraction Status</th>
+                  <th className="p-3 font-semibold">Wrapper CDS View</th>
+                  <th className="p-3 font-semibold">Result</th>
+                </tr></thead>
+                <tbody>{viewsWrapperMappings.map((view) => {
+                  const extraction = view.data_extraction_status || 'UNKNOWN';
+                  const wrapper = extraction === 'TRUE' || extraction === 'FALSE'
+                    ? 'Not Required'
+                    : view.wrapper_cds_view || 'Not Created';
+                  const result = extraction === 'TRUE'
+                    ? 'Extraction Enabled'
+                    : extraction === 'FALSE'
+                      ? 'Extraction Disabled'
+                      : wrapper === 'Not Created' ? 'Wrapper Not Created' : 'Wrapper Created';
+                  return <tr key={view.source_cds_view} className="border-t border-[#D9E4F0]">
+                    <td className="p-3 font-mono text-[#0F2747]">{view.source_cds_view}</td>
+                    <td className="p-3">{extraction}</td>
+                    <td className="p-3 font-mono">{wrapper}</td>
+                    <td className="p-3">{result}</td>
+                  </tr>;
+                })}</tbody>
+              </table>
             </div>
+          ) : (
+            <div className="rounded-xl border border-[#D9E4F0] bg-[#F4F8FC] p-6 text-center text-xs text-[#5F7187]">No CDS mapping results are available.</div>
           )}
 
-          {/* No Views Selected State */}
-          {!isLoadingMappings && selectedViews.length === 0 && (
-            <div className="p-8 text-center bg-[#F4F8FC] border border-[#D9E4F0] rounded-2xl space-y-4">
-              <Database className="w-10 h-10 text-gray-400 mx-auto" />
-              <div>
-                <div className="text-sm font-bold text-[#0F2747]">No CDS Views Selected</div>
-                <p className="text-xs text-[#5F7187] mt-1">
-                  Please select one or more CDS views to view their wrapper relationships and field mappings.
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={() => setActiveStep(3)}
-                className="px-4 py-2 rounded-xl bg-[#1677FF] hover:bg-[#0A6ED1] text-white text-xs font-semibold"
-              >
-                ← Back to CDS Selection
-              </button>
-            </div>
-          )}
-
-          {/* View Relationship Cards: Support Single and Multiple Selected Views */}
-          <div className="space-y-6">
-            {viewsWrapperMappings.map((viewItem) => {
-              const hasWrapper = viewItem.wrapper_cds_view && viewItem.wrapper_cds_view !== 'Not Created';
-              const isConfirmedActive = (viewItem.wrapper_creation_status || '').toUpperCase().includes('ACTIVE');
-              const isInactive = (viewItem.wrapper_creation_status || '').toUpperCase().includes('INACTIVE');
-
-              return (
-                <div
-                  key={viewItem.source_cds_view}
-                  className="rounded-2xl border border-[#D9E4F0] bg-white overflow-hidden shadow-sm hover:border-[#0A6ED1]/40 transition"
-                >
-                  {/* Card Header: Clear Relationship Display */}
-                  <div className="bg-[#F8FAFC] border-b border-[#D9E4F0] p-4 flex flex-col xl:flex-row xl:items-center justify-between gap-4">
-                    {/* Relationship Pillars: Original CDS View → Wrapper CDS View */}
-                    <div className="flex flex-wrap items-center gap-3">
-                      {/* Original CDS View */}
-                      <div className="bg-white border border-[#D9E4F0] rounded-xl px-3.5 py-2.5 shadow-2xs min-w-[200px]">
-                        <div className="text-[10px] uppercase font-bold tracking-wider text-[#5F7187] flex items-center gap-1.5">
-                          <Database className="w-3.5 h-3.5 text-[#0A6ED1]" />
-                          Original CDS View
-                        </div>
-                        <div className="font-mono text-sm font-bold text-[#0A6ED1] mt-0.5">
-                          {viewItem.source_cds_view}
-                        </div>
-                        <div className="text-[11px] text-[#5F7187] truncate max-w-xs">
-                          {viewItem.source_label || 'SAP Standard CDS View'}
-                        </div>
-                      </div>
-
-                      {/* Directional Relationship Arrow */}
-                      <div className="flex flex-col items-center justify-center px-1">
-                        <span className="text-[9px] font-semibold uppercase tracking-wider text-[#0A6ED1] bg-blue-50 px-2 py-0.5 rounded-full border border-blue-200">
-                          Extraction Wrapper
-                        </span>
-                        <ArrowRight className="w-5 h-5 text-[#0A6ED1] stroke-[2.5]" />
-                      </div>
-
-                      {/* Corresponding Wrapper CDS View */}
-                      <div
-                        className={`rounded-xl px-3.5 py-2.5 shadow-2xs min-w-[220px] border ${
-                          hasWrapper
-                            ? 'bg-emerald-50/50 border-emerald-300'
-                            : 'bg-gray-50 border-gray-200'
-                        }`}
-                      >
-                        <div className="text-[10px] uppercase font-bold tracking-wider text-[#5F7187] flex items-center gap-1.5">
-                          {hasWrapper ? (
-                            <CheckCircle2 className="w-3.5 h-3.5 text-[#00A878]" />
-                          ) : (
-                            <AlertCircle className="w-3.5 h-3.5 text-gray-400" />
-                          )}
-                          Corresponding Wrapper CDS View
-                        </div>
-                        <div className="font-mono text-sm font-bold mt-0.5">
-                          {hasWrapper ? (
-                            <span className="text-emerald-700 font-bold">{viewItem.wrapper_cds_view}</span>
-                          ) : (
-                            <span className="text-gray-500 italic">Not Created</span>
-                          )}
-                        </div>
-                        <div className="text-[11px] text-[#5F7187] font-mono">
-                          {hasWrapper && viewItem.wrapper_sql_view_name
-                            ? `SQL View: ${viewItem.wrapper_sql_view_name}`
-                            : 'No Wrapper Registered'}
-                        </div>
-                      </div>
-
-                      {/* Wrapper Creation Status Badge */}
-                      <div className="flex flex-col justify-center">
-                        <div className="text-[10px] uppercase font-bold tracking-wider text-[#5F7187] mb-1">
-                          Wrapper Creation Status
-                        </div>
-                        {isConfirmedActive ? (
-                          <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold bg-[#E8F8F3] text-[#00A878] border border-[#00A878]/30 shadow-2xs">
-                            <CheckCircle className="w-3.5 h-3.5" />
-                            {viewItem.wrapper_creation_status}
-                          </span>
-                        ) : isInactive ? (
-                          <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold bg-amber-50 text-amber-700 border border-amber-300 shadow-2xs">
-                            <Zap className="w-3.5 h-3.5" />
-                            {viewItem.wrapper_creation_status}
-                          </span>
-                        ) : (
-                          <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold bg-gray-100 text-gray-600 border border-gray-300 shadow-2xs">
-                            <AlertCircle className="w-3.5 h-3.5 text-gray-400" />
-                            Not Created
-                          </span>
-                        )}
-                      </div>
-                    </div>
-
-                    {/* Wrapper Actions */}
-                    <div className="flex flex-wrap items-center gap-2">
-                      {!hasWrapper ? (
-                        <button
-                          type="button"
-                          onClick={() => openWrapperForm(viewItem.source_cds_view)}
-                          className="px-3.5 py-1.5 rounded-lg bg-[#1677FF] hover:bg-[#0A6ED1] text-white text-xs font-semibold flex items-center gap-1.5 shadow-xs transition"
-                        >
-                          <Plus className="w-3.5 h-3.5" /> Create Extraction Wrapper
-                        </button>
-                      ) : isInactive ? (
-                        <button
-                          type="button"
-                          onClick={() => openWrapperForActivation(viewItem.source_cds_view, viewItem.wrapper_cds_view)}
-                          className="px-3.5 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white text-xs font-semibold flex items-center gap-1.5 shadow-xs transition"
-                        >
-                          <Zap className="w-3.5 h-3.5" /> Activate CDS in SAP
-                        </button>
-                      ) : null}
-
-                      <button
-                        type="button"
-                        onClick={() => handleOpenLiveSource(viewItem.source_cds_view)}
-                        className="px-3 py-1.5 rounded-lg bg-white border border-[#D9E4F0] hover:bg-[#F4F8FC] text-xs font-medium text-[#0F2747] flex items-center gap-1 shadow-2xs transition"
-                        title="View Original CDS DDL Source"
-                      >
-                        <FileText className="w-3.5 h-3.5 text-[#0A6ED1]" /> Original Source
-                      </button>
-
-                      {hasWrapper && (
-                        <button
-                          type="button"
-                          onClick={() => handleOpenLiveSource(viewItem.wrapper_cds_view)}
-                          className="px-3 py-1.5 rounded-lg bg-white border border-emerald-300 hover:bg-emerald-50 text-xs font-medium text-emerald-700 flex items-center gap-1 shadow-2xs transition"
-                          title="View Wrapper CDS DDL Source"
-                        >
-                          <FileText className="w-3.5 h-3.5 text-emerald-600" /> Wrapper Source
-                        </button>
-                      )}
-
-                      <button
-                        type="button"
-                        onClick={() => handleOpenDataPreview(viewItem.source_cds_view)}
-                        className="px-3 py-1.5 rounded-lg bg-white border border-[#D9E4F0] hover:bg-[#F4F8FC] text-xs font-medium text-[#0F2747] flex items-center gap-1 shadow-2xs transition"
-                        title="Data Preview"
-                      >
-                        <Table className="w-3.5 h-3.5 text-[#0A6ED1]" /> Preview
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* Mapping Details Table for this CDS View */}
-                  <div className="p-4 space-y-3">
-                    <div className="flex items-center justify-between">
-                      <div className="text-xs font-bold text-[#0F2747] flex items-center gap-2">
-                        <span>Mapping Details ({viewItem.field_mappings?.length || 0} Fields)</span>
-                        <span className="text-[11px] font-normal text-[#5F7187]">
-                          — Projected from original <span className="font-mono text-[#0A6ED1]">{viewItem.source_cds_view}</span> to target <span className="font-mono text-[#00A878]">{viewItem.wrapper_cds_view !== 'Not Created' ? viewItem.wrapper_cds_view : 'Wrapper'}</span>
-                        </span>
-                      </div>
-                      <span className="text-[11px] font-mono text-[#5F7187] bg-[#F4F8FC] px-2.5 py-0.5 rounded border border-[#D9E4F0]">
-                        Package: {viewItem.package || 'ZTRAINING_2026'}
-                      </span>
-                    </div>
-
-                    <div className="rounded-xl border border-[#D9E4F0] overflow-hidden overflow-x-auto">
-                      <table className="w-full text-xs">
-                        <thead className="bg-[#F4F8FC] text-[#5F7187] text-left border-b border-[#D9E4F0]">
-                          <tr>
-                            <th className="p-2.5 font-semibold">Business Field</th>
-                            <th className="p-2.5 font-semibold">Original Technical Field</th>
-                            <th className="p-2.5 font-semibold">Wrapper Target Field</th>
-                            <th className="p-2.5 font-semibold">Field Label</th>
-                            <th className="p-2.5 font-semibold">Data Type</th>
-                            <th className="p-2.5 font-semibold text-center">Key</th>
-                            <th className="p-2.5 font-semibold">Evidence / Source</th>
-                          </tr>
-                        </thead>
-                        <tbody className="divide-y divide-[#D9E4F0]">
-                          {viewItem.field_mappings && viewItem.field_mappings.length > 0 ? (
-                            viewItem.field_mappings.map((fm, fIdx) => (
-                              <tr key={fm.business_field + '-' + fIdx} className="hover:bg-[#F4F8FC]/50 transition">
-                                <td className="p-2.5 font-semibold text-[#0F2747]">{fm.business_field}</td>
-                                <td className="p-2.5 font-mono text-[#0A6ED1] font-semibold">{fm.source_field}</td>
-                                <td className="p-2.5 font-mono text-[#00A878] font-semibold">{fm.wrapper_target_field}</td>
-                                <td className="p-2.5 text-[#5F7187]">{fm.field_label || '—'}</td>
-                                <td className="p-2.5 font-mono text-purple-700 font-medium">
-                                  {fm.data_type}
-                                  {fm.length ? `(${fm.length}${fm.decimals ? `,${fm.decimals}` : ''})` : ''}
-                                </td>
-                                <td className="p-2.5 text-center">
-                                  {fm.is_key ? (
-                                    <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-amber-100 text-amber-800 border border-amber-300">
-                                      KEY
-                                    </span>
-                                  ) : (
-                                    <span className="text-gray-300">—</span>
-                                  )}
-                                </td>
-                                <td className="p-2.5 text-[11px] text-[#5F7187]">{fm.evidence || 'Authoritative SAP Metadata'}</td>
-                              </tr>
-                            ))
-                          ) : (
-                            <tr>
-                              <td colSpan={7} className="p-4 text-center text-gray-500 italic">
-                                No field mappings available for this view.
-                              </td>
-                            </tr>
-                          )}
-                        </tbody>
-                      </table>
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-
-          {/* Bottom Navigation */}
-          <div className="flex items-center justify-between pt-4 border-t border-[#D9E4F0]">
-            <button
-              type="button"
-              onClick={() => setActiveStep(3)}
-              className="px-4 py-2 rounded-lg border border-[#D9E4F0] hover:bg-[#F4F8FC] text-xs text-[#0F2747] font-medium flex items-center gap-1.5 transition"
-            >
-              <ArrowLeft className="w-3.5 h-3.5" /> ← Back to CDS Selection
+          <footer className="border-t border-[#D9E4F0] pt-4">
+            <button type="button" onClick={() => setActiveStep(3)} className="flex items-center gap-1.5 rounded-lg border border-[#D9E4F0] px-4 py-2 text-xs font-medium text-[#0F2747] hover:bg-[#F4F8FC]">
+              <ArrowLeft className="h-3.5 w-3.5" /> Back to CDS Selection
             </button>
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={() => {
-                  if (selectedViews.length > 0) {
-                    void loadViewsWrapperMappings(selectedViews);
-                  }
-                }}
-                disabled={isLoadingMappings}
-                className="px-4 py-2 rounded-xl bg-white border border-[#D9E4F0] hover:bg-[#F4F8FC] text-xs font-semibold text-[#0F2747] flex items-center gap-1.5 shadow-xs transition"
-              >
-                <RefreshCw className={`w-3.5 h-3.5 text-[#0A6ED1] ${isLoadingMappings ? 'animate-spin' : ''}`} />
-                Refresh All Wrapper Mappings
-              </button>
-            </div>
-          </div>
-        </div>
+          </footer>
+        </section>
       )}
-
-
-
 
       {/* 4. MODALS */}
 

@@ -528,7 +528,49 @@ export async function fetchViewsWrapperMapping(
     const err = await res.json().catch(() => ({}));
     throw new Error(err?.detail || 'Failed to fetch views wrapper mapping');
   }
-  return res.json();
+  const payload = await res.json();
+  // The API's persisted mapping contract is { success, views }, where each
+  // row is a source CDS plus its registered wrapper and field mappings.
+  // Convert that contract once here to the shape consumed by the mapping UI.
+  const views = Array.isArray(payload?.views) ? payload.views : [];
+  const views_mapping = views.map((view: any) => ({
+    source_cds_view: view.source_cds_view,
+    source_label: view.description || view.source_cds_view,
+    data_extraction_status: view.data_extraction_status || 'UNKNOWN',
+    result: view.data_extraction_status === 'TRUE'
+      ? 'Extraction Enabled'
+      : view.data_extraction_status === 'FALSE'
+        ? 'Extraction Disabled'
+        : view.has_wrapper ? 'Wrapper Created' : 'Wrapper Not Created',
+    can_create_wrapper: view.can_create_wrapper === true,
+    package: view.package || '',
+    wrapper_cds_view: view.data_extraction_status === 'TRUE' || view.data_extraction_status === 'FALSE'
+      ? 'Not Required'
+      : view.has_wrapper ? view.wrapper_cds_view : 'Not Created',
+    wrapper_sql_view_name: view.sql_view_name || '',
+    wrapper_creation_status: view.data_extraction_status === 'TRUE' || view.data_extraction_status === 'FALSE'
+      ? 'Not Required'
+      : view.has_wrapper ? (view.wrapper_creation_status || 'Created') : 'Not Created',
+    wrapper_activation_status: view.wrapper_activation_status || '',
+    created_at: view.created_at,
+    field_mappings: (view.mappings || []).map((mapping: any) => ({
+      business_field: mapping.business_field || mapping.actual_field || '',
+      source_field: mapping.actual_field || '',
+      wrapper_target_field: mapping.wrapper_target_field || mapping.actual_field || '',
+      field_label: mapping.field_label || '',
+      data_type: mapping.data_type || '',
+      length: mapping.length || 0,
+      decimals: mapping.decimals || 0,
+      is_key: Boolean(mapping.is_key),
+      evidence: mapping.evidence || '',
+    })),
+  }));
+  return {
+    views_mapping,
+    total_views: views_mapping.length,
+    views_with_wrappers: views_mapping.filter((view: any) => view.wrapper_cds_view !== 'Not Created').length,
+    views_without_wrappers: views_mapping.filter((view: any) => view.wrapper_cds_view === 'Not Created').length,
+  };
 }
 
 

@@ -7,9 +7,11 @@ from pydantic import BaseModel, Field, field_validator
 from src.logging_config import logger
 from src.services.cds_generation_validator import CDSGenerationValidator
 from src.services.gemini_service import GeminiService
+from src.services.discovery_service import CDSDiscoveryService
 
 router = APIRouter(prefix="/requirements", tags=["Requirements"])
 gemini_svc = GeminiService()
+discovery_svc = CDSDiscoveryService()
 
 
 class ExtractFieldsPayload(BaseModel):
@@ -623,7 +625,43 @@ async def get_views_wrapper_mapping_endpoint(payload: ViewsWrapperMappingPayload
     - Retrieves technical field mappings with labels, data types, keys, and wrapper projections
     """
     from src.services.wrapper_registry import get_views_wrapper_mapping_details
-    views_data = await get_views_wrapper_mapping_details(payload.selected_views, payload.required_fields)
+    selected_views = list(dict.fromkeys(v.strip() for v in payload.selected_views if v and v.strip()))
+    statuses = {}
+    for source_name in selected_views:
+        evidence = await discovery_svc.get_verified_component_extraction_status(source_name)
+        sap_status = evidence.get("sap_metadata_status", "UNKNOWN")
+        statuses[source_name.upper()] = sap_status if sap_status in {"TRUE", "FALSE"} else "UNKNOWN"
+
+    # Only UNKNOWN sources need a wrapper-registry lookup. This avoids offering
+    # or querying unnecessary wrappers for extraction-enabled/disabled CDSs.
+    unknown_views = [v for v in selected_views if statuses[v.upper()] == "UNKNOWN"]
+    unknown_details = await get_views_wrapper_mapping_details(unknown_views, payload.required_fields) if unknown_views else []
+    details_by_source = {item["source_cds_view"].upper(): item for item in unknown_details}
+    views_data = []
+    for source_name in selected_views:
+        data_status = statuses[source_name.upper()]
+        if data_status == "UNKNOWN":
+            view = details_by_source.get(source_name.upper(), {
+                "source_cds_view": source_name,
+                "description": source_name,
+                "package": "",
+                "mappings": [],
+                "has_wrapper": False,
+                "wrapper_cds_view": "Not Created",
+            })
+            view["can_create_wrapper"] = not view.get("has_wrapper", False)
+        else:
+            view = {
+                "source_cds_view": source_name,
+                "description": source_name,
+                "package": "",
+                "mappings": [],
+                "has_wrapper": False,
+                "wrapper_cds_view": "Not Required",
+                "can_create_wrapper": False,
+            }
+        view["data_extraction_status"] = data_status
+        views_data.append(view)
     return {"success": True, "views": views_data}
 
 
